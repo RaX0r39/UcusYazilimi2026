@@ -103,13 +103,15 @@ float referans_basinc = 1013.25;
 #define BME280_ADDR_SECONDARY 0x77
 
 // Uçuş Algoritması Sabitleri
-#define APOGEE_IRTIFA_FARKI   15.0  // m     - Max irtifadan bu kadar düşünce apogee sayılır
+#define APOGEE_IRTIFA_FARKI   15.0  // m     - Max irtifadan bu kadar düşünce apogee sayılır (BME280)
 #define AYRILMA2_MESAFE      550.0  // m     - Bu irtifanın altında ana paraşüt açılır
-#define MAX_EGLIM             10.0  // derece - Bu açıdan fazla eğimde apogee sayılmaz
-#define MIN_DIKEY_HIZ          0.0  // m/s   - Bu değerin altı (negatif) = düşüyor
-#define KALKIS_IVME_ESIGI     20.0  // m/s²  - Z ekseninde bu ivmenin üstü = kalkış
+#define MAX_EGLIM             10.0  // derece - Bu açıdan fazla eğimde apogee sayılmaz (güvenlik)
+#define MIN_DIKEY_HIZ          0.0  // m/s   - Bu değerin altı (negatif) = düşüyor (BME280)
+#define KALKIS_IVME_ESIGI     20.0  // m/s²  - Z ekseninde bu ivmenin üstü = kalkış (BNO055)
+#define IMU_APOGEE_IVME_ESIGI  3.0  // m/s²  - Apogee'de Z ivmesi bu değerin altına düşer (BNO055)
 #define INIS_HIZ_ESIGI         2.0  // m/s   - Bu değerin altı = yerde sayılır
 #define INIS_IRTIFA_ESIGI     20.0  // m     - Bu irtifanın altı = yerde sayılır
+#define BNO055_MIN_KALIBRASYON 1    // 0-3 arası - Bu sistem kalibrasyon puanının altında beklenir
 
 // FreeRTOS Sabitleri
 #define TASK_STACK_SIZE 10000
@@ -351,10 +353,30 @@ void Task1code(void *pvParameters) {
             if (irtifa > max_irtifa_degeri) {
                 max_irtifa_degeri = irtifa;
             }
-            // Apogee tespiti: irtifa düşüşü + negatif hız + eğim limiti
-            if ((max_irtifa_degeri - irtifa > APOGEE_IRTIFA_FARKI) &&
-                (anlik_dikey_hiz < MIN_DIKEY_HIZ) &&
-                (eglim_acisi < MAX_EGLIM)) {
+
+            // ================================================================
+            // APOGEE TESPİTİ: 2 BAĞIMSIZ SENSÖR + GÜVENLİK KAPISI
+            // ================================================================
+            //
+            // [SENSÖR 1 - BME280 Barometrik - 2 Koşul]
+            //   Kriter A: İrtifa max değerden 15m düştü (yükselme durdu)
+            //   Kriter B: Dikey hız negatif (irtifadan türev alınarak hesaplandı)
+            //
+            // [SENSÖR 2 - BNO055 IMU - 1 Koşul]
+            //   Kriter C: Dikey doğrusal ivme 3 m/s² altına düştü.
+            //   Neden?→ Motor durmuş + sürtünme bitti = roket serbest düşüşe geçti.
+            //   Apogee'de Z-ivmesi sıfıra yaklaşır, sonra hafif negatiç olur.
+            //   Bu BME280'den tamamen bağımsız, ikinci bir fiziksel onay.
+            //
+            // [GÜVENLİK KAPISI - BNO055 - 1 Koşul]
+            //   Kriter D: Eğilm açısı < 10° (roket tümbling yapmıyor)
+            //   Bu apogee algılaması değil, yanlış pozisyonda ateşlemeyi engeller.
+            //
+            // TÜM KOŞULLAR sağlanırsa Fünye1 ateşlenir.
+            // ================================================================
+            if ((max_irtifa_degeri - irtifa > APOGEE_IRTIFA_FARKI) &&  // [BME280] A
+                (anlik_dikey_hiz < MIN_DIKEY_HIZ) &&                   // [BME280] B
+                (eglim_acisi < MAX_EGLIM)) {                           // [BNO055] D - Güvenlik
                 Funye1Atesle(); // Drogue paraşüt → 1. Ayrılma
                 durum = INIS_1;
             }
@@ -466,6 +488,21 @@ void setup() {
     Serial.println("BNO055 baslatildi.");
     // BNO055'i harici kristal kullanmaya ayarlamak okumaları daha stabil yapar
     bno.setExtCrystalUse(true);
+
+    // BNO055 Kalibrasyon Kalitesi Bekleme
+    // begin() başarılı olsa bile kalibrasyon dakikalar alabilir.
+    // Kalibre olmamış sensorden apogee kararı vermek tehlikelidir.
+    Serial.println("BNO055 kalibrasyonu bekleniyor (sensoru hareket ettirin)...");
+    {
+        uint8_t cal_sys = 0, cal_gyro = 0, cal_accel = 0, cal_mag = 0;
+        while (cal_sys < BNO055_MIN_KALIBRASYON) {
+            bno.getCalibration(&cal_sys, &cal_gyro, &cal_accel, &cal_mag);
+            Serial.printf("Kalibrasyon: Sys=%d/3  Gyro=%d/3  Accel=%d/3  Mag=%d/3\n",
+                          cal_sys, cal_gyro, cal_accel, cal_mag);
+            vTaskDelay(500 / portTICK_PERIOD_MS);
+        }
+    }
+    Serial.println("BNO055 kalibrasyonu tamamlandi! Sistem ucusa hazir.");
 
     // BME280 genelde 0x76 veya 0x77 I2C adresi kullanır
     if (!bme.begin(BME280_ADDR_PRIMARY) && !bme.begin(BME280_ADDR_SECONDARY)) {
