@@ -24,6 +24,10 @@
   - [x] Sensör ve Haberleşme donanımları arası FreeRTOS Queue aktarımı
   - [ ] Kurtarma Sistemi Durum (Ayrılma1/Ayrılma2) bayraklarının haberleşme paketine doğru işlenmesi
   - [ ] Buzzer ve LED uyarı sistemlerinin uçuş evrelerine (State) bağlanması
+
+  [ PERFORMANS / OPTİMİZASYON ]
+  - [ ] DMA'nın daha iyi implemente edilmesi
+  - [ ] TelemetryPacket kısmının optimize edilmesi
 ================================================================================
 */
 
