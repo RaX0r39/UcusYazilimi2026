@@ -122,9 +122,7 @@ struct TelemetryPacket {
     float gyroX, gyroY, gyroZ;
     float roll, pitch, yaw;
     float basinc, bmeSicaklik, irtifa, nem;
-    float gpsEnlem, gpsBoylam, gpsIrtifa;
-    int gpsUydu;
-    bool gpsGecerli;
+    float gpsEnlem, gpsBoylam;
     bool ayrilma1_durum;
     bool ayrilma2_durum;
 };
@@ -198,6 +196,11 @@ void Task1code(void *pvParameters) {
         gpsGecerli = gps.location.isValid();
     }
 
+
+    // UÇUŞ ALGORİTMASI BURAYA EKLENMELİ
+    
+
+
     // --- STRUCT DOLDURMA VE CORE 1'E GÖNDERME ---
     TelemetryPacket packet;
     packet.ivmeX = ivmeX; packet.ivmeY = ivmeY; packet.ivmeZ = ivmeZ;
@@ -205,9 +208,7 @@ void Task1code(void *pvParameters) {
     packet.roll = roll; packet.pitch = pitch; packet.yaw = yaw;
     packet.basinc = basinc; packet.bmeSicaklik = bmeSicaklik; 
     packet.irtifa = irtifa; packet.nem = nem;
-    packet.gpsEnlem = gpsEnlem; packet.gpsBoylam = gpsBoylam; 
-    packet.gpsIrtifa = gpsIrtifa; packet.gpsUydu = gpsUydu; 
-    packet.gpsGecerli = gpsGecerli;
+    packet.gpsEnlem = gpsEnlem; packet.gpsBoylam = gpsBoylam;
     packet.ayrilma1_durum = ayrilma1; packet.ayrilma2_durum = ayrilma2;
 
     // Kuyruğa Gönder (Kuyruk doluysa beklemez (0), veriyi atlar. 
