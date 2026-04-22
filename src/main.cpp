@@ -6,6 +6,30 @@
 #include <Adafruit_BME280.h>
 #include <TinyGPS++.h>
 
+/*
+================================================================================
+  SENSÖR VERİ HARİTASI (Hangi veri nereden alınıyor ve değişkendeki adı ne?)
+================================================================================
+  1. BNO055 (IMU - İvme, Jiroskop, Yönelim)
+     - Doğrusal İvme (Yerçekimsiz) -> ivmeX, ivmeY, ivmeZ
+     - Jiroskop (Açısal Hız)       -> gyroX, gyroY, gyroZ
+     - Euler Açıları (Yönelim)     -> roll, pitch, yaw
+  
+  2. BME280 (Barometre - Basınç, Sıcaklık, Nem, İrtifa)
+     - Basınç (Pascal)             -> basinc
+     - Sıcaklık (Santigrat)        -> bmeSicaklik
+     - Nem (%)                     -> nem
+     - Hesaplanan İrtifa (Metre)   -> irtifa
+
+  3. GY-NEO-7M (GPS - Konum, Yükseklik)
+     - Enlem                       -> gpsEnlem
+     - Boylam                      -> gpsBoylam
+     - GPS İrtifası (Metre)        -> gpsIrtifa
+     - Bağlı Uydu Sayısı           -> gpsUydu
+     - Konum Geçerliliği           -> gpsGecerli
+================================================================================
+*/
+
 #define PIN_TTL_RX 1
 #define PIN_TTL_TX 3
 #define PIN_LED_2 4
