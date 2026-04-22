@@ -57,6 +57,7 @@
 TaskHandle_t Task1;
 TaskHandle_t Task2;
 
+//Uçuş Algoritması İçin Gerekli Değişkenler
 bool ayrilma1 = false;
 bool ayrilma2 = false;
 
@@ -81,6 +82,26 @@ float gpsIrtifa = 0.0;
 int gpsUydu = 0;
 bool gpsGecerli = false;
 
+// --- TELEMETRİ YAPISI VE KUYRUK ---
+// "pragma pack(push, 1)" struct'ın bellekte boşluksuz (padding olmadan) paketlenmesini sağlar,
+// bu sayede UART üzerinden ham byte olarak (DMA tarzında) basmak çok daha güvenli ve tutarlı olur.
+#pragma pack(push, 1)
+struct TelemetryPacket {
+    float ivmeX, ivmeY, ivmeZ;
+    float gyroX, gyroY, gyroZ;
+    float roll, pitch, yaw;
+    float basinc, bmeSicaklik, irtifa, nem;
+    float gpsEnlem, gpsBoylam, gpsIrtifa;
+    int gpsUydu;
+    bool gpsGecerli;
+    bool ayrilma1_durum;
+    bool ayrilma2_durum;
+};
+#pragma pack(pop)
+
+QueueHandle_t telemetryQueue;
+
+// Hazır Kullanılacak Metodlar/Fonksiyonlar
 void Funye1Atesle(){
     digitalWrite(PIN_FUNYE_1, HIGH);
     delay(400);
@@ -146,6 +167,22 @@ void Task1code(void *pvParameters) {
         gpsGecerli = gps.location.isValid();
     }
 
+    // --- STRUCT DOLDURMA VE CORE 1'E GÖNDERME ---
+    TelemetryPacket packet;
+    packet.ivmeX = ivmeX; packet.ivmeY = ivmeY; packet.ivmeZ = ivmeZ;
+    packet.gyroX = gyroX; packet.gyroY = gyroY; packet.gyroZ = gyroZ;
+    packet.roll = roll; packet.pitch = pitch; packet.yaw = yaw;
+    packet.basinc = basinc; packet.bmeSicaklik = bmeSicaklik; 
+    packet.irtifa = irtifa; packet.nem = nem;
+    packet.gpsEnlem = gpsEnlem; packet.gpsBoylam = gpsBoylam; 
+    packet.gpsIrtifa = gpsIrtifa; packet.gpsUydu = gpsUydu; 
+    packet.gpsGecerli = gpsGecerli;
+    packet.ayrilma1_durum = ayrilma1; packet.ayrilma2_durum = ayrilma2;
+
+    // Kuyruğa Gönder (Kuyruk doluysa beklemez (0), veriyi atlar. 
+    // Sensör okuma hızının bloke olmasını engelleriz.)
+    xQueueSend(telemetryQueue, &packet, 0);
+
     // KESİNLİKLE SİLİNMESİ YASAKTIR: Eğer burası boş döngüde kalırsa ESP32 Watchdog hatası verir ve çöker!
     vTaskDelay(10 / portTICK_PERIOD_MS); // Yaklaşık 100 Hz çalışma frekansı
   }
@@ -157,19 +194,39 @@ void Task2code(void *pvParameters) {
   Serial.print("Task2 running on core ");
   Serial.println(xPortGetCoreID());
 
+  TelemetryPacket incomingPacket;
+
   for (;;) {
     // ----------------------------------------------------
     // KENDI KODUNUZU BURAYA YAZIN (CORE 1 - SÜREKLİ DÖNGÜ)
     // ----------------------------------------------------
     
-    // KESİNLİKLE SİLİNMESİ YASAKTIR: Eğer burası boş döngüde kalırsa ESP32 Watchdog hatası verir ve çöker!
-    vTaskDelay(1000 / portTICK_PERIOD_MS);
+    // Core 0'dan gelen kuyruğu bekler (portMAX_DELAY ile veri gelene kadar CPU'yu yormadan Wait konumunda yatar)
+    if (xQueueReceive(telemetryQueue, &incomingPacket, portMAX_DELAY) == pdTRUE) {
+        
+        // 1. Seri Port (UART0 - Bilgisayar) Üzerinden Non-Blocking Aktarım
+        // TX Buffer yeterince büyük ayarlandığı için (.setTxBufferSize)
+        // CPU burada veriyi RAM'e çok hızlı kopyalar ve asla bloke olmaz.
+        // Verinin donanımdan hatta basılmasını arkada çalışan interrupt'lar (DMA tarzında) halleder.
+        Serial.write((uint8_t*)&incomingPacket, sizeof(TelemetryPacket));
+        
+        // 2. Serial1 (UART1 - LoRa) Üzerinden Non-Blocking Aktarım
+        Serial1.write((uint8_t*)&incomingPacket, sizeof(TelemetryPacket));
+    }
+    
+    // Eğer portMAX_DELAY ile kuyrukta bekliyorsanız vTaskDelay'e ihtiyacınız kalmaz, 
+    // ama güvenli tarafta kalmak için ufak bir gecikme eklenebilir.
+    // Ancak veri geldiği an işlenmesi için kaldırdık, CPU xQueueReceive'de güvenle dinlenir.
   }
 }
 
 void setup() {
     // 1. Bilgisayar Haberleşmesi (Sadece 115200 kalsın)
-    Serial.begin(115200);
+    // Non-blocking (DMA tarzı) aktarım için TX buffer boyutlarını büyütüyoruz (varsayılan 256 byte'tır).
+    // Buffer dolana kadar .write() fonksiyonları non-blocking (beklemesiz) çalışır, 
+    // arkada hardware interrupt'lar veriyi FIFO üzerinden gönderir.
+    Serial.setTxBufferSize(1024);
+    Serial.begin(115200, SERIAL_8N1, PIN_TTL_RX, PIN_TTL_TX);
     delay(1000); 
     Serial.println("--- ROKET SISTEMI BASLATILIYOR ---");
 
@@ -212,7 +269,16 @@ void setup() {
 
     // 4. Modül Haberleşmeleri
     Serial2.begin(9600, SERIAL_8N1, PIN_GPS_RX, PIN_GPS_TX);
+    
+    // LoRa (UART1) TX buffer büyütülerek Task2'deki gönderimlerin Non-Blocking olması sağlanıyor
+    Serial1.setTxBufferSize(1024);
     Serial1.begin(9600, SERIAL_8N1, PIN_LORA_RX, PIN_LORA_TX);
+
+    // FreeRTOS Kuyruk Başlatma (Maksimum 10 paketlik yer ayıralım)
+    telemetryQueue = xQueueCreate(10, sizeof(TelemetryPacket));
+    if(telemetryQueue == NULL){
+      Serial.println("DIKKAT: Kuyruk olusturulamadi!");
+    }
 
     // 5. RTOS Görevleri
     // Core 0: Genelde sensör okuma ve uçuş algoritması (Kritik işler)
