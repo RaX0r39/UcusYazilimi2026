@@ -5,6 +5,27 @@
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BME280.h>
 #include <TinyGPS++.h>
+/*
+================================================================================
+  YAPILACAKLAR LİSTESİ (TODO & MİMARİ PLAN)
+================================================================================
+  [ CORE 0 (Uçuş Kontrolü & Kritik İşlemler) ]
+  - [x] Sensör Verilerinin Okunması (BNO055, BME280, GPS)
+  - [ ] Uçuş Algoritması (Apogee tespiti, serbest düşüş anlama vb.)
+  - [ ] Fünye (Ateşleme) Kontrollerinin durum makinesi (State Machine) ile yapılması
+  - [ ] Kalibrasyon ve Başlangıç İrtifası / Basıncı referans alımı
+
+  [ CORE 1 (Haberleşme & Çevre Birimleri) ]
+  - [x] PC (TTL) ve LoRa üzerinden Non-Blocking Veri Aktarımı
+  - [ ] Yer İstasyonu Formatına Göre Verinin Metin (String/CSV) Olarak Parse Edilmesi (Şu an ham binary basılıyor)
+  - [ ] SD Karta Loglama (Kara Kutu): Verilerin uçuş esnasında kaydedilmesi
+
+  [ ORTAK / GENEL ]
+  - [x] Sensör ve Haberleşme donanımları arası FreeRTOS Queue aktarımı
+  - [ ] Kurtarma Sistemi Durum (Ayrılma1/Ayrılma2) bayraklarının haberleşme paketine doğru işlenmesi
+  - [ ] Buzzer ve LED uyarı sistemlerinin uçuş evrelerine (State) bağlanması
+================================================================================
+*/
 
 /*
 ================================================================================
