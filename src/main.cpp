@@ -63,6 +63,9 @@
 */
 
 
+// Uyarlanabilir Sabitler
+#define BULUNDUGUN_NOKTANIN_BASINCI 1013.25
+
 // Uyarlanabilir Pinler 
 #define PIN_TTL_RX 1
 #define PIN_TTL_TX 3
@@ -98,6 +101,7 @@ float max_irtifa_degeri = 0.0;
 float onceki_irtifa = 0.0;
 unsigned long onceki_zaman = 0;
 float anlik_dikey_hiz = 0.0;
+float eglim_acisi = 0.0; // Roketin dikeyden sapma açısı (Tilt)
 
 // --- KALMAN FİLTRESİ SINIFI ---
 class SimpleKalmanFilter {
@@ -173,6 +177,7 @@ struct TelemetryPacket {
     float roll, pitch, yaw;
     float basinc, bmeSicaklik, irtifa, nem;
     float dikeyHiz; // Yeni eklenen dikey hız verisi
+    float eglimAcisi; // Yeni eklenen eğim açısı
     float gpsEnlem, gpsBoylam;
     bool ayrilma1_durum;
     bool ayrilma2_durum;
@@ -257,12 +262,17 @@ void Task1code(void *pvParameters) {
     roll = kf_roll.updateEstimate(o.orientation.y);
     pitch = kf_pitch.updateEstimate(o.orientation.z);
 
+    // Roketin yere göre eğim açısını (Tilt Angle) hesapla (0 = Tam dik)
+    float p_rad = pitch * DEG_TO_RAD;
+    float r_rad = roll * DEG_TO_RAD;
+    eglim_acisi = acos(cos(p_rad) * cos(r_rad)) * RAD_TO_DEG;
+
     // 2. Barometre (BME280) Verilerini Okuma
     bmeSicaklik = kf_bmeSicaklik.updateEstimate(bme.readTemperature());
     basinc = kf_basinc.updateEstimate(bme.readPressure());
     nem = kf_nem.updateEstimate(bme.readHumidity());
     // 1013.25 standart deniz seviyesi basıncıdır. Gerekirse bulunduğunuz yere göre güncelleyin.
-    irtifa = kf_irtifa.updateEstimate(bme.readAltitude(1013.25)); 
+    irtifa = kf_irtifa.updateEstimate(bme.readAltitude(BULUNDUGUN_NOKTANIN_BASINCI)); 
 
     // Anlık dikey hızı (Vz) hesapla
     anlik_dikey_hiz = hesapla_dikey_hiz(irtifa);
@@ -289,9 +299,14 @@ void Task1code(void *pvParameters) {
         max_irtifa_degeri = irtifa;
     }
     
-    if ((max_irtifa_degeri - irtifa > 15.0) && !ayrilma1) {
+    if ((max_irtifa_degeri - irtifa > 15.0) && !ayrilma1 && anlik_dikey_hiz < 0.0 && eglim_acisi < 10.0) {
         Funye1Atesle();
     }
+
+    if ((irtifa < 550.0) && !ayrilma2) {
+        Funye2Atesle();
+    }
+    
 
 
     // --- STRUCT DOLDURMA VE CORE 1'E GÖNDERME ---
@@ -302,6 +317,7 @@ void Task1code(void *pvParameters) {
     packet.basinc = basinc; packet.bmeSicaklik = bmeSicaklik; 
     packet.irtifa = irtifa; packet.nem = nem;
     packet.dikeyHiz = anlik_dikey_hiz; // Pakete dikey hızı ekle
+    packet.eglimAcisi = eglim_acisi; // Pakete eğim açısını ekle
     packet.gpsEnlem = gpsEnlem; packet.gpsBoylam = gpsBoylam;
     packet.ayrilma1_durum = ayrilma1; packet.ayrilma2_durum = ayrilma2;
 
