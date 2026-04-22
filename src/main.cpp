@@ -52,6 +52,12 @@
      - GPS İrtifası (Metre)        -> gpsIrtifa
      - Bağlı Uydu Sayısı           -> gpsUydu
      - Konum Geçerliliği           -> gpsGecerli
+
+  4. TELEMETRİ PAKETİ (TelemetryPacket Struct)
+     - Yukarıdaki tüm veriler ve roketin kurtarma durumları (Ayrılma1/2), 
+       'TelemetryPacket' isimli yapıya (struct) doldurulur.
+     - Pragma pack(1) kullanıldığı için veriler bellekte boşluksuz dizilir, 
+       bu sayede yer istasyonuna (LoRa/TTL) ham (binary) ve en hızlı şekilde iletilir.
 ================================================================================
 */
 
