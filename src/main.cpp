@@ -22,6 +22,7 @@
 
   [ ORTAK / GENEL ]
   - [x] Sensör ve Haberleşme donanımları arası FreeRTOS Queue aktarımı
+  - [x] Kalman Filtresi ekle
   - [ ] Kurtarma Sistemi Durum (Ayrılma1/Ayrılma2) bayraklarının haberleşme paketine doğru işlenmesi
   - [ ] Buzzer ve LED uyarı sistemlerinin uçuş evrelerine (State) bağlanması
 
@@ -91,6 +92,55 @@ TaskHandle_t Task2;
 //Uçuş Algoritması İçin Gerekli Değişkenler
 bool ayrilma1 = false;
 bool ayrilma2 = false;
+float max_irtifa_degeri = 0.0;
+
+// --- HIZ HESAPLAMA DEĞİŞKENLERİ ---
+float onceki_irtifa = 0.0;
+unsigned long onceki_zaman = 0;
+float anlik_dikey_hiz = 0.0;
+
+// --- KALMAN FİLTRESİ SINIFI ---
+class SimpleKalmanFilter {
+  public:
+    SimpleKalmanFilter(float mea_e, float est_e, float q) : 
+      err_measure(mea_e), err_estimate(est_e), q(q), last_estimate(0), kalman_gain(0), first_run(true) {}
+
+    float updateEstimate(float mea) {
+      if (first_run) {
+        last_estimate = mea;
+        first_run = false;
+      }
+      kalman_gain = err_estimate / (err_estimate + err_measure);
+      float current_estimate = last_estimate + kalman_gain * (mea - last_estimate);
+      err_estimate = (1.0f - kalman_gain) * err_estimate + fabs(last_estimate - current_estimate) * q;
+      last_estimate = current_estimate;
+      return current_estimate;
+    }
+  private:
+    float err_measure;
+    float err_estimate;
+    float q;
+    float last_estimate;
+    float kalman_gain;
+    bool first_run;
+};
+
+// --- KALMAN FİLTRESİ NESNELERİ ---
+// Parametreler: (Ölçüm Hatası, Tahmin Hatası, Süreç Gürültüsü)
+SimpleKalmanFilter kf_ivmeX(0.1, 0.1, 0.01);
+SimpleKalmanFilter kf_ivmeY(0.1, 0.1, 0.01);
+SimpleKalmanFilter kf_ivmeZ(0.1, 0.1, 0.01);
+SimpleKalmanFilter kf_gyroX(0.1, 0.1, 0.01);
+SimpleKalmanFilter kf_gyroY(0.1, 0.1, 0.01);
+SimpleKalmanFilter kf_gyroZ(0.1, 0.1, 0.01);
+SimpleKalmanFilter kf_roll(0.1, 0.1, 0.01);
+SimpleKalmanFilter kf_pitch(0.1, 0.1, 0.01);
+SimpleKalmanFilter kf_yaw(0.1, 0.1, 0.01);
+
+SimpleKalmanFilter kf_basinc(2.0, 2.0, 0.1);
+SimpleKalmanFilter kf_bmeSicaklik(0.5, 0.5, 0.01);
+SimpleKalmanFilter kf_irtifa(1.5, 1.5, 0.1);
+SimpleKalmanFilter kf_nem(1.0, 1.0, 0.1);
 
 // --- SENSÖR NESNELERİ ---
 Adafruit_BNO055 bno = Adafruit_BNO055(55, 0x28); // BNO055 genelde 0x28 veya 0x29 kullanır
@@ -122,6 +172,7 @@ struct TelemetryPacket {
     float gyroX, gyroY, gyroZ;
     float roll, pitch, yaw;
     float basinc, bmeSicaklik, irtifa, nem;
+    float dikeyHiz; // Yeni eklenen dikey hız verisi
     float gpsEnlem, gpsBoylam;
     bool ayrilma1_durum;
     bool ayrilma2_durum;
@@ -145,6 +196,38 @@ void Funye2Atesle(){
     ayrilma2 = true;
 }
 
+// Görseldeki formüle göre Anlık Dikey Hız (Vz) Hesaplama Fonksiyonu
+float hesapla_dikey_hiz(float guncel_irtifa) {
+    unsigned long suanki_zaman = micros();
+    
+    // İlk ölçüm kontrolü
+    if (onceki_zaman == 0) {
+        onceki_zaman = suanki_zaman;
+        onceki_irtifa = guncel_irtifa;
+        return 0.0;
+    }
+    
+    // Delta t hesaplaması (mikrosaniyeden saniyeye dönüşüm)
+    float delta_t = (suanki_zaman - onceki_zaman) / 1000000.0;
+    
+    // Bölme hatası (divide-by-zero) koruması
+    if (delta_t <= 0.0) {
+        return anlik_dikey_hiz; // Geçerli zaman farkı yoksa eski hızı koru
+    }
+    
+    // Delta Altitude (İrtifa farkı)
+    float delta_irtifa = guncel_irtifa - onceki_irtifa;
+    
+    // V_z = Delta Altitude / Delta t
+    float hiz_z = delta_irtifa / delta_t;
+    
+    // Gelecek hesaplama için değerleri güncelle
+    onceki_zaman = suanki_zaman;
+    onceki_irtifa = guncel_irtifa;
+    
+    return hiz_z;
+}
+
 // Core 0'da çalışacak olan görevin fonsiyonu
 void Task1code(void *pvParameters) {
  
@@ -158,28 +241,31 @@ void Task1code(void *pvParameters) {
     sensors_event_t a, g, o;
     // İvme (Linear Acceleration - Yerçekimi hariç)
     bno.getEvent(&a, Adafruit_BNO055::VECTOR_LINEARACCEL);
-    ivmeX = a.acceleration.x;
-    ivmeY = a.acceleration.y;
-    ivmeZ = a.acceleration.z;
+    ivmeX = kf_ivmeX.updateEstimate(a.acceleration.x);
+    ivmeY = kf_ivmeY.updateEstimate(a.acceleration.y);
+    ivmeZ = kf_ivmeZ.updateEstimate(a.acceleration.z);
 
     // Jiroskop
     bno.getEvent(&g, Adafruit_BNO055::VECTOR_GYROSCOPE);
-    gyroX = g.gyro.x;
-    gyroY = g.gyro.y;
-    gyroZ = g.gyro.z;
+    gyroX = kf_gyroX.updateEstimate(g.gyro.x);
+    gyroY = kf_gyroY.updateEstimate(g.gyro.y);
+    gyroZ = kf_gyroZ.updateEstimate(g.gyro.z);
 
     // Euler Açıları (Yönelim)
     bno.getEvent(&o, Adafruit_BNO055::VECTOR_EULER);
-    yaw = o.orientation.x;
-    roll = o.orientation.y;
-    pitch = o.orientation.z;
+    yaw = kf_yaw.updateEstimate(o.orientation.x);
+    roll = kf_roll.updateEstimate(o.orientation.y);
+    pitch = kf_pitch.updateEstimate(o.orientation.z);
 
     // 2. Barometre (BME280) Verilerini Okuma
-    bmeSicaklik = bme.readTemperature();
-    basinc = bme.readPressure();
-    nem = bme.readHumidity();
+    bmeSicaklik = kf_bmeSicaklik.updateEstimate(bme.readTemperature());
+    basinc = kf_basinc.updateEstimate(bme.readPressure());
+    nem = kf_nem.updateEstimate(bme.readHumidity());
     // 1013.25 standart deniz seviyesi basıncıdır. Gerekirse bulunduğunuz yere göre güncelleyin.
-    irtifa = bme.readAltitude(1013.25); 
+    irtifa = kf_irtifa.updateEstimate(bme.readAltitude(1013.25)); 
+
+    // Anlık dikey hızı (Vz) hesapla
+    anlik_dikey_hiz = hesapla_dikey_hiz(irtifa);
 
     // 3. GPS Verilerini Okuma
     // Serial2 üzerinden gelen verileri TinyGPS++ nesnesine besliyoruz
@@ -198,7 +284,14 @@ void Task1code(void *pvParameters) {
 
 
     // UÇUŞ ALGORİTMASI BURAYA EKLENMELİ
+    // Max irtifa güncellemesi
+    if (irtifa > max_irtifa_degeri) {
+        max_irtifa_degeri = irtifa;
+    }
     
+    if ((max_irtifa_degeri - irtifa > 15.0) && !ayrilma1) {
+        Funye1Atesle();
+    }
 
 
     // --- STRUCT DOLDURMA VE CORE 1'E GÖNDERME ---
@@ -208,6 +301,7 @@ void Task1code(void *pvParameters) {
     packet.roll = roll; packet.pitch = pitch; packet.yaw = yaw;
     packet.basinc = basinc; packet.bmeSicaklik = bmeSicaklik; 
     packet.irtifa = irtifa; packet.nem = nem;
+    packet.dikeyHiz = anlik_dikey_hiz; // Pakete dikey hızı ekle
     packet.gpsEnlem = gpsEnlem; packet.gpsBoylam = gpsBoylam;
     packet.ayrilma1_durum = ayrilma1; packet.ayrilma2_durum = ayrilma2;
 
