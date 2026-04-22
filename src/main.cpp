@@ -11,9 +11,10 @@
 ================================================================================
   [ CORE 0 (Uçuş Kontrolü & Kritik İşlemler) ]
   - [x] Sensör Verilerinin Okunması (BNO055, BME280, GPS)
-  - [ ] Uçuş Algoritması (Apogee tespiti, serbest düşüş anlama vb.)
-  - [ ] Fünye (Ateşleme) Kontrollerinin durum makinesi (State Machine) ile yapılması
-  - [ ] Kalibrasyon ve Başlangıç İrtifası / Basıncı referans alımı
+  - [x] Uçuş Algoritması (Apogee tespiti, serbest düşüş anlama vb.)
+  - [x] Fünye (Ateşleme) Kontrollerinin durum makinesi (State Machine) ile yapılması
+  - [x] Kalibrasyon ve Başlangıç İrtifası / Basıncı referans alımı
+  - [ ] BNO055 Z-Ekseni Yön Kalibrasyonu (Şu an Z ekseni yukarı varsayılıyor, doğrulanmalı!)
 
   [ CORE 1 (Haberleşme & Çevre Birimleri) ]
   - [x] PC (TTL) ve LoRa üzerinden Non-Blocking Veri Aktarımı
@@ -23,7 +24,7 @@
   [ ORTAK / GENEL ]
   - [x] Sensör ve Haberleşme donanımları arası FreeRTOS Queue aktarımı
   - [x] Kalman Filtresi ekle
-  - [ ] Kurtarma Sistemi Durum (Ayrılma1/Ayrılma2) bayraklarının haberleşme paketine doğru işlenmesi
+  - [x] Kurtarma Sistemi Durum (Ayrılma1/Ayrılma2) bayraklarının haberleşme paketine doğru işlenmesi
   - [ ] Buzzer ve LED uyarı sistemlerinin uçuş evrelerine (State) bağlanması
 
   [ PERFORMANS / OPTİMİZASYON ]
@@ -64,7 +65,8 @@
 
 
 // Uyarlanabilir Sabitler
-#define BULUNDUGUN_NOKTANIN_BASINCI 1013.25
+// referans_basinc: setup() içinde BME280'den otomatik ölçülür. Başlangıç değeri standart deniz seviyesidir.
+float referans_basinc = 1013.25;
 
 // Uyarlanabilir Pinler 
 #define PIN_TTL_RX 1
@@ -88,9 +90,46 @@
 #define PIN_LORA_RX 33
 #define PIN_SDKART_DET 35
 
+// Haberleşme Sabitleri
+#define BAUD_TTL 115200
+#define BAUD_GPS 9600
+#define BAUD_LORA 9600
+#define UART_BUFFER_SIZE 1024
+
+// Sensör Sabitleri
+#define BNO055_DEF 55
+#define BNO055_ADDR 0x28
+#define BME280_ADDR_PRIMARY 0x76
+#define BME280_ADDR_SECONDARY 0x77
+
+// Uçuş Algoritması Sabitleri
+#define APOGEE_IRTIFA_FARKI   15.0  // m     - Max irtifadan bu kadar düşünce apogee sayılır
+#define AYRILMA2_MESAFE      550.0  // m     - Bu irtifanın altında ana paraşüt açılır
+#define MAX_EGLIM             10.0  // derece - Bu açıdan fazla eğimde apogee sayılmaz
+#define MIN_DIKEY_HIZ          0.0  // m/s   - Bu değerin altı (negatif) = düşüyor
+#define KALKIS_IVME_ESIGI     20.0  // m/s²  - Z ekseninde bu ivmenin üstü = kalkış
+#define INIS_HIZ_ESIGI         2.0  // m/s   - Bu değerin altı = yerde sayılır
+#define INIS_IRTIFA_ESIGI     20.0  // m     - Bu irtifanın altı = yerde sayılır
+
+// FreeRTOS Sabitleri
+#define TASK_STACK_SIZE 10000
+#define TASK1_PRIORITY 2
+#define TASK2_PRIORITY 1
+#define TELEMETRY_QUEUE_LEN 10
+
 // Görev takipçisi (Task Handle) tanımları
 TaskHandle_t Task1;
 TaskHandle_t Task2;
+
+// Uçuş Durum Makinesi (State Machine)
+enum UcusDurumu {
+    HAZIR      = 0, // Rampa üzerinde, kalkış bekleniyor
+    YUKSELIYOR = 1, // Kalkış algılandı, yükselme fazı
+    INIS_1     = 2, // Apogee geçildi, drogue (küçük) paraşüt açıldı
+    INIS_2     = 3, // Alçak irtifaya inildi, ana paraşüt açıldı
+    INDI       = 4  // Yere iniş tamamlandı, sistem pasif
+};
+UcusDurumu durum = HAZIR;
 
 //Uçuş Algoritması İçin Gerekli Değişkenler
 bool ayrilma1 = false;
@@ -147,7 +186,7 @@ SimpleKalmanFilter kf_irtifa(1.5, 1.5, 0.1);
 SimpleKalmanFilter kf_nem(1.0, 1.0, 0.1);
 
 // --- SENSÖR NESNELERİ ---
-Adafruit_BNO055 bno = Adafruit_BNO055(55, 0x28); // BNO055 genelde 0x28 veya 0x29 kullanır
+Adafruit_BNO055 bno = Adafruit_BNO055(BNO055_DEF, BNO055_ADDR); 
 Adafruit_BME280 bme; // I2C üzerinden iletişim
 TinyGPSPlus gps;
 
@@ -181,6 +220,7 @@ struct TelemetryPacket {
     float gpsEnlem, gpsBoylam;
     bool ayrilma1_durum;
     bool ayrilma2_durum;
+    uint8_t ucus_durumu; // Uçuş evresi: 0=Hazır, 1=Yükseliyor, 2=İniş1, 3=İniş2, 4=İndi
 };
 #pragma pack(pop)
 
@@ -189,14 +229,14 @@ QueueHandle_t telemetryQueue;
 // Hazır Kullanılacak Metodlar/Fonksiyonlar
 void Funye1Atesle(){
     digitalWrite(PIN_FUNYE_1, HIGH);
-    delay(400);
+    vTaskDelay(400 / portTICK_PERIOD_MS); 
     digitalWrite(PIN_FUNYE_1, LOW);
     ayrilma1 = true;
 }
 
 void Funye2Atesle(){
     digitalWrite(PIN_FUNYE_2, HIGH);
-    delay(400);
+    vTaskDelay(400 / portTICK_PERIOD_MS); 
     digitalWrite(PIN_FUNYE_2, LOW);
     ayrilma2 = true;
 }
@@ -213,7 +253,7 @@ float hesapla_dikey_hiz(float guncel_irtifa) {
     }
     
     // Delta t hesaplaması (mikrosaniyeden saniyeye dönüşüm)
-    float delta_t = (suanki_zaman - onceki_zaman) / 1000000.0;
+    float delta_t = (float)(suanki_zaman - onceki_zaman) / 1000000.0f;
     
     // Bölme hatası (divide-by-zero) koruması
     if (delta_t <= 0.0) {
@@ -265,14 +305,17 @@ void Task1code(void *pvParameters) {
     // Roketin yere göre eğim açısını (Tilt Angle) hesapla (0 = Tam dik)
     float p_rad = pitch * DEG_TO_RAD;
     float r_rad = roll * DEG_TO_RAD;
-    eglim_acisi = acos(cos(p_rad) * cos(r_rad)) * RAD_TO_DEG;
+    // [FIX#5] Kalman gürültüsü cos(p)*cos(r)'yi 1.0'ı aşabilir → acos(NaN) → apogee asla tetiklenmez
+    float cos_val = cos(p_rad) * cos(r_rad);
+    cos_val = constrain(cos_val, -1.0f, 1.0f);
+    eglim_acisi = acos(cos_val) * RAD_TO_DEG;
 
     // 2. Barometre (BME280) Verilerini Okuma
     bmeSicaklik = kf_bmeSicaklik.updateEstimate(bme.readTemperature());
     basinc = kf_basinc.updateEstimate(bme.readPressure());
     nem = kf_nem.updateEstimate(bme.readHumidity());
-    // 1013.25 standart deniz seviyesi basıncıdır. Gerekirse bulunduğunuz yere göre güncelleyin.
-    irtifa = kf_irtifa.updateEstimate(bme.readAltitude(BULUNDUGUN_NOKTANIN_BASINCI)); 
+    // referans_basinc: setup() içinde BME280'den otomatik kalibre edildi
+    irtifa = kf_irtifa.updateEstimate(bme.readAltitude(referans_basinc));
 
     // Anlık dikey hızı (Vz) hesapla
     anlik_dikey_hiz = hesapla_dikey_hiz(irtifa);
@@ -293,21 +336,49 @@ void Task1code(void *pvParameters) {
     }
 
 
-    // UÇUŞ ALGORİTMASI BURAYA EKLENMELİ
-    // Max irtifa güncellemesi
-    if (irtifa > max_irtifa_degeri) {
-        max_irtifa_degeri = irtifa;
-    }
-    
-    if ((max_irtifa_degeri - irtifa > 15.0) && !ayrilma1 && anlik_dikey_hiz < 0.0 && eglim_acisi < 10.0) {
-        Funye1Atesle();
-    }
+    // --- UÇUŞ ALGORİTMASI ---
+    switch (durum) {
+        case HAZIR:
+            // Kalkış tespiti: Z ekseninde yeterli ivme → YUKSELIYOR
+            // [ TODO ] BNO055 Z-ekseni yönü doğrulanmalı!
+            if (ivmeZ > KALKIS_IVME_ESIGI) {
+                durum = YUKSELIYOR;
+            }
+            break;
 
-    if ((irtifa < 550.0) && !ayrilma2) {
-        Funye2Atesle();
-    }
-    
+        case YUKSELIYOR:
+            // Max irtifa güncelle (sadece yükseliş fazında)
+            if (irtifa > max_irtifa_degeri) {
+                max_irtifa_degeri = irtifa;
+            }
+            // Apogee tespiti: irtifa düşüşü + negatif hız + eğim limiti
+            if ((max_irtifa_degeri - irtifa > APOGEE_IRTIFA_FARKI) &&
+                (anlik_dikey_hiz < MIN_DIKEY_HIZ) &&
+                (eglim_acisi < MAX_EGLIM)) {
+                Funye1Atesle(); // Drogue paraşüt → 1. Ayrılma
+                durum = INIS_1;
+            }
+            break;
 
+        case INIS_1:
+            // Alçak irtifaya inildiğinde ana paraşütü aç → 2. Ayrılma
+            if ((irtifa < AYRILMA2_MESAFE) && (max_irtifa_degeri > AYRILMA2_MESAFE)) {
+                Funye2Atesle(); // Ana paraşüt
+                durum = INIS_2;
+            }
+            break;
+
+        case INIS_2:
+            // Yere iniş tespiti: hız sıfıra yakın + çok alçakta
+            if ((anlik_dikey_hiz > -INIS_HIZ_ESIGI) && (irtifa < INIS_IRTIFA_ESIGI)) {
+                durum = INDI;
+            }
+            break;
+
+        case INDI:
+            // Sistem pasif, hiçbir aksiyon alınmaz
+            break;
+    }
 
     // --- STRUCT DOLDURMA VE CORE 1'E GÖNDERME ---
     TelemetryPacket packet;
@@ -320,6 +391,7 @@ void Task1code(void *pvParameters) {
     packet.eglimAcisi = eglim_acisi; // Pakete eğim açısını ekle
     packet.gpsEnlem = gpsEnlem; packet.gpsBoylam = gpsBoylam;
     packet.ayrilma1_durum = ayrilma1; packet.ayrilma2_durum = ayrilma2;
+    packet.ucus_durumu = (uint8_t)durum;
 
     // Kuyruğa Gönder (Kuyruk doluysa beklemez (0), veriyi atlar. 
     // Sensör okuma hızının bloke olmasını engelleriz.)
@@ -363,12 +435,9 @@ void Task2code(void *pvParameters) {
 }
 
 void setup() {
-    // 1. Bilgisayar Haberleşmesi (Sadece 115200 kalsın)
-    // Non-blocking (DMA tarzı) aktarım için TX buffer boyutlarını büyütüyoruz (varsayılan 256 byte'tır).
-    // Buffer dolana kadar .write() fonksiyonları non-blocking (beklemesiz) çalışır, 
-    // arkada hardware interrupt'lar veriyi FIFO üzerinden gönderir.
-    Serial.setTxBufferSize(1024);
-    Serial.begin(115200, SERIAL_8N1, PIN_TTL_RX, PIN_TTL_TX);
+    // 1. Bilgisayar Haberleşmesi
+    Serial.setTxBufferSize(UART_BUFFER_SIZE);
+    Serial.begin(BAUD_TTL, SERIAL_8N1, PIN_TTL_RX, PIN_TTL_TX);
     delay(1000); 
     Serial.println("--- ROKET SISTEMI BASLATILIYOR ---");
 
@@ -380,7 +449,10 @@ void setup() {
     
     pinMode(PIN_BUZZER, OUTPUT);
     pinMode(PIN_LED, OUTPUT);
-    // ... Diğer pinMode tanımların ...
+    pinMode(PIN_LED_1, OUTPUT);
+    pinMode(PIN_LED_2, OUTPUT);
+    pinMode(PIN_LED_3, OUTPUT);
+    pinMode(PIN_SDKART_DET, INPUT_PULLUP); // SD kart algılama genelde pull-up gerektirir
 
     // 3. Protokoller
     Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL); 
@@ -388,49 +460,63 @@ void setup() {
 
     // Sensör Başlatma İşlemleri
     if (!bno.begin()) {
-        Serial.println("BNO055 bulunamadi! Baglantilari kontrol edin.");
-    } else {
-        Serial.println("BNO055 baslatildi.");
-        // BNO055'i harici kristal kullanmaya ayarlamak okumaları daha stabil yapar
-        bno.setExtCrystalUse(true);
+        Serial.println("KRITIK: BNO055 bulunamadi! Sistem durduruluyor.");
+        while(true) { vTaskDelay(1000 / portTICK_PERIOD_MS); }
     }
+    Serial.println("BNO055 baslatildi.");
+    // BNO055'i harici kristal kullanmaya ayarlamak okumaları daha stabil yapar
+    bno.setExtCrystalUse(true);
 
     // BME280 genelde 0x76 veya 0x77 I2C adresi kullanır
-    if (!bme.begin(0x76) && !bme.begin(0x77)) { 
-        Serial.println("BME280 bulunamadi! Baglantilari kontrol edin.");
-    } else {
-        Serial.println("BME280 baslatildi.");
-        // Gelişmiş okuma ayarları (BME280)
-        bme.setSampling(Adafruit_BME280::MODE_NORMAL,
-                        Adafruit_BME280::SAMPLING_X2,  // Sicaklik
-                        Adafruit_BME280::SAMPLING_X16, // Basinc
-                        Adafruit_BME280::SAMPLING_X1,  // Nem
-                        Adafruit_BME280::FILTER_X16,
-                        Adafruit_BME280::STANDBY_MS_0_5);
+    if (!bme.begin(BME280_ADDR_PRIMARY) && !bme.begin(BME280_ADDR_SECONDARY)) {
+        Serial.println("KRITIK: BME280 bulunamadi! Sistem durduruluyor.");
+        while(true) { vTaskDelay(1000 / portTICK_PERIOD_MS); }
     }
+    Serial.println("BME280 baslatildi.");
+    // Gelişmiş okuma ayarları (BME280)
+    bme.setSampling(Adafruit_BME280::MODE_NORMAL,
+                    Adafruit_BME280::SAMPLING_X2,  // Sicaklik
+                    Adafruit_BME280::SAMPLING_X16, // Basinc
+                    Adafruit_BME280::SAMPLING_X1,  // Nem
+                    Adafruit_BME280::FILTER_X16,
+                    Adafruit_BME280::STANDBY_MS_0_5);
+
+    // 3.1 Ground Kalibrasyon: Anlık yer seviyesi basıncını ölç (20 örnek ortalaması)
+    delay(200);
+    Serial.println("Yer kalibrasyonu yapiliyor...");
+    float basinc_toplam = 0.0;
+    for (int i = 0; i < 20; i++) {
+        basinc_toplam += bme.readPressure() / 100.0F; // Pascal → hPa
+        delay(50);
+    }
+    referans_basinc = basinc_toplam / 20.0;
+    Serial.print("Referans Basinc (hPa): ");
+    Serial.println(referans_basinc);
+
 
     // 4. Modül Haberleşmeleri
-    Serial2.begin(9600, SERIAL_8N1, PIN_GPS_RX, PIN_GPS_TX);
+    Serial2.begin(BAUD_GPS, SERIAL_8N1, PIN_GPS_RX, PIN_GPS_TX);
     
     // LoRa (UART1) TX buffer büyütülerek Task2'deki gönderimlerin Non-Blocking olması sağlanıyor
-    Serial1.setTxBufferSize(1024);
-    Serial1.begin(9600, SERIAL_8N1, PIN_LORA_RX, PIN_LORA_TX);
+    Serial1.setTxBufferSize(UART_BUFFER_SIZE);
+    Serial1.begin(BAUD_LORA, SERIAL_8N1, PIN_LORA_RX, PIN_LORA_TX);
 
     // FreeRTOS Kuyruk Başlatma (Maksimum 10 paketlik yer ayıralım)
-    telemetryQueue = xQueueCreate(10, sizeof(TelemetryPacket));
+    telemetryQueue = xQueueCreate(TELEMETRY_QUEUE_LEN, sizeof(TelemetryPacket));
     if(telemetryQueue == NULL){
-      Serial.println("DIKKAT: Kuyruk olusturulamadi!");
+      Serial.println("KRITIK: Kuyruk olusturulamadi! Sistem durduruluyor.");
+      while(true) { vTaskDelay(1000 / portTICK_PERIOD_MS); }
     }
 
     // 5. RTOS Görevleri
     // Core 0: Genelde sensör okuma ve uçuş algoritması (Kritik işler)
     xTaskCreatePinnedToCore(
-        Task1code, "UcusGörevi", 10000, NULL, 2, &Task1, 0); 
+        Task1code, "UcusGörevi", TASK_STACK_SIZE, NULL, TASK1_PRIORITY, &Task1, 0); 
     delay(100); // Kısa bir nefes payı
 
     // Core 1: Genelde yer istasyonu haberleşmesi ve SD kart (Yavaş işler)
     xTaskCreatePinnedToCore(
-        Task2code, "HaberlesmeGörevi", 10000, NULL, 1, &Task2, 1); 
+        Task2code, "HaberlesmeGörevi", TASK_STACK_SIZE, NULL, TASK2_PRIORITY, &Task2, 1); 
     
     Serial.println("Setup Tamam. Görevler Dagiltildi.");
 }
