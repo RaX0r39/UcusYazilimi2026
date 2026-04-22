@@ -30,6 +30,8 @@
 ================================================================================
 */
 
+
+// Uyarlanabilir Pinler 
 #define PIN_TTL_RX 1
 #define PIN_TTL_TX 3
 #define PIN_LED_2 4
