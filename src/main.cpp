@@ -91,10 +91,24 @@ float referans_basinc = 1013.25;
 #define PIN_SDKART_DET 35
 
 // Haberleşme Sabitleri
-#define BAUD_TTL 115200
-#define BAUD_GPS 9600
-#define BAUD_LORA 9600
-#define UART_BUFFER_SIZE 1024
+#define BAUD_TTL             115200  // UART0  — PC / Yer İstasyonu (TTL)
+#define BAUD_GPS               9600  // UART2  — GY-NEO-7M GPS modülü
+#define BAUD_LORA              9600  // UART1  — E32-433T30D LoRa modülü (SX1278 tabanlı)
+#define UART_BUFFER_SIZE       1024  // TX buffer (Non-Blocking gönderim için)
+
+// --- ÇERÇEVE PROTOKOLü (Framed Binary) ---
+// Format: [0xAA][0x55][LEN:1B][TelemetryPacket:71B][CRC16_HI:1B][CRC16_LO:1B]
+// CRC algoritması: CRC16-CCITT (poly=0x1021, init=0xFFFF)
+// Not: E32-433T30D kendi RF katmanında CRC/FEC yapıyor.
+//      Uygulama katmanı CRC'si UART/TTL hattını ve buffer kaymalarını korur.
+#define SYNC_BYTE_1          0xAA
+#define SYNC_BYTE_2          0x55
+// FRAME_SIZE: struct sonrasında hesaplanır → sizeof(TelemetryPacket) + 2+1+2 = 76 byte
+
+// --- LORA GÖNDERİM HIZI ---
+// E32-433T30D @ 9600 baud, 76 byte/çerçeve → ~12.6 çerçeve/sn max
+// Core 0 queue → 100 Hz; LoRa → her LORA_GONDERIM_ORANI pakettte bir (≈10 Hz)
+#define LORA_GONDERIM_ORANI    10
 
 // Sensör Sabitleri
 #define BNO055_DEF 55
@@ -275,6 +289,35 @@ float hesapla_dikey_hiz(float guncel_irtifa) {
     return hiz_z;
 }
 
+// --- CRC16-CCITT (poly=0x1021, init=0xFFFF) ---
+// E32-433T30D UART hattında bit flip / buffer kayması tespiti için
+uint16_t crc16_ccitt(const uint8_t* data, size_t len) {
+    uint16_t crc = 0xFFFF;
+    for (size_t i = 0; i < len; i++) {
+        crc ^= ((uint16_t)data[i] << 8);
+        for (int j = 0; j < 8; j++) {
+            crc = (crc & 0x8000) ? (crc << 1) ^ 0x1021 : (crc << 1);
+        }
+    }
+    return crc;
+}
+
+// --- ÇERÇEVELI PAKET GÖNDERME ---
+// Format: [SYNC1=0xAA][SYNC2=0x55][LEN=71][...71 byte payload...][CRC16_HI][CRC16_LO]
+void gonder_paket_framed(HardwareSerial& port, const TelemetryPacket& pkt) {
+    const uint8_t* payload = (const uint8_t*)&pkt;
+    const size_t   len     = sizeof(TelemetryPacket); // 71
+    uint16_t       crc     = crc16_ccitt(payload, len);
+
+    port.write(SYNC_BYTE_1);       // 0xAA
+    port.write(SYNC_BYTE_2);       // 0x55
+    port.write((uint8_t)len);      // 71
+    port.write(payload, len);      // TelemetryPacket (ham binary)
+    port.write((uint8_t)(crc >> 8));   // CRC16 high byte
+    port.write((uint8_t)(crc & 0xFF)); // CRC16 low byte
+    // Toplam: 76 byte/çerçeve
+}
+
 // Core 0'da çalışacak olan görevin fonsiyonu
 void Task1code(void *pvParameters) {
  
@@ -307,7 +350,7 @@ void Task1code(void *pvParameters) {
     // Roketin yere göre eğim açısını (Tilt Angle) hesapla (0 = Tam dik)
     float p_rad = pitch * DEG_TO_RAD;
     float r_rad = roll * DEG_TO_RAD;
-    // [FIX#5] Kalman gürültüsü cos(p)*cos(r)'yi 1.0'ı aşabilir → acos(NaN) → apogee asla tetiklenmez
+    // [FIX] Kalman gürültüsü cos(p)*cos(r)'yi 1.0'ı aşabilir → acos(NaN) → apogee asla tetiklenmez
     float cos_val = cos(p_rad) * cos(r_rad);
     cos_val = constrain(cos_val, -1.0f, 1.0f);
     eglim_acisi = acos(cos_val) * RAD_TO_DEG;
@@ -425,34 +468,45 @@ void Task1code(void *pvParameters) {
 }
 
 // Core 1'de çalışacak olan görevin fonsiyonu
+// ─────────────────────────────────────────────────────────────────────────────
+// GÖREVİ: Core 0'dan gelen TelemetryPacket'i çerçeveleyip iki kanala gönderir.
+//
+// TTL  (UART0 / Serial)  → PC / Yer İstasyonu     @ 115200 baud  → HER paket (~100 Hz)
+// LoRa (UART1 / Serial1) → E32-433T30D modülü     @   9600 baud  → Her 10. paket (~10 Hz)
+//
+// ÇERÇEVE FORMATI (76 byte/paket):
+//   [0xAA][0x55][LEN=71][...TelemetryPacket 71B...][CRC16_HI][CRC16_LO]
+//
+// CRC16-CCITT: UART hattında bit flip / buffer kayması tespiti.
+// E32-433T30D zaten RF katmanında CRC/FEC yapıyor; bu uygulama katmanı CRC'si.
+// ─────────────────────────────────────────────────────────────────────────────
 void Task2code(void *pvParameters) {
-  // Başlangıç (setup) ayarları (Sadece bir kez çalışır)
-  Serial.print("Task2 running on core ");
+  Serial.print("[CORE1] Haberlesme gorevi baslatildi, core: ");
   Serial.println(xPortGetCoreID());
 
   TelemetryPacket incomingPacket;
+  uint32_t lora_sayac = 0; // LoRa hız sınırlayıcı sayacı
 
   for (;;) {
-    // ----------------------------------------------------
-    // KENDI KODUNUZU BURAYA YAZIN (CORE 1 - SÜREKLİ DÖNGÜ)
-    // ----------------------------------------------------
-    
-    // Core 0'dan gelen kuyruğu bekler (portMAX_DELAY ile veri gelene kadar CPU'yu yormadan Wait konumunda yatar)
+    // Queue'dan paket al (CPU'yu yormadan veri gelene kadar bekler)
     if (xQueueReceive(telemetryQueue, &incomingPacket, portMAX_DELAY) == pdTRUE) {
-        
-        // 1. Seri Port (UART0 - Bilgisayar) Üzerinden Non-Blocking Aktarım
-        // TX Buffer yeterince büyük ayarlandığı için (.setTxBufferSize)
-        // CPU burada veriyi RAM'e çok hızlı kopyalar ve asla bloke olmaz.
-        // Verinin donanımdan hatta basılmasını arkada çalışan interrupt'lar (DMA tarzında) halleder.
-        Serial.write((uint8_t*)&incomingPacket, sizeof(TelemetryPacket));
-        
-        // 2. Serial1 (UART1 - LoRa) Üzerinden Non-Blocking Aktarım
-        Serial1.write((uint8_t*)&incomingPacket, sizeof(TelemetryPacket));
+
+        // 1. TTL — Her paketi çerçeveleyip PC'ye gönder (~100 Hz)
+        //    TX buffer büyük ayarlandığı için write() anında döner,
+        //    UART donanımı gönderimi interrupt'larla arka planda tamamlar.
+        gonder_paket_framed(Serial, incomingPacket);
+
+        // 2. LoRa (E32-433T30D) — Her LORA_GONDERIM_ORANI pakettte bir gönder (~10 Hz)
+        //    Neden? 9600 baud @ 76 byte = ~78ms/paket → max ~12.8 paket/sn.
+        //    100 Hz queue hızında tümü gönderilseydi TX buffer taşardı.
+        lora_sayac++;
+        if (lora_sayac >= LORA_GONDERIM_ORANI) {
+            gonder_paket_framed(Serial1, incomingPacket);
+            lora_sayac = 0;
+        }
     }
-    
-    // Eğer portMAX_DELAY ile kuyrukta bekliyorsanız vTaskDelay'e ihtiyacınız kalmaz, 
-    // ama güvenli tarafta kalmak için ufak bir gecikme eklenebilir.
-    // Ancak veri geldiği an işlenmesi için kaldırdık, CPU xQueueReceive'de güvenle dinlenir.
+    // portMAX_DELAY ile Queue'da beklediğimiz için vTaskDelay gerekmez.
+    // CPU xQueueReceive içinde güvenle uyur, Watchdog tetiklenmez.
   }
 }
 
