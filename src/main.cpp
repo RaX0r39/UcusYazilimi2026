@@ -17,12 +17,14 @@
   - [x] Fünye (Ateşleme) Kontrollerinin durum makinesi (State Machine) ile yapılması
   - [x] Kalibrasyon ve Başlangıç İrtifası / Basıncı referans alımı
   - [ ] BNO055 Z-Ekseni Yön Kalibrasyonu (Şu an Z ekseni yukarı varsayılıyor, doğrulanmalı!)
+  - [ ] Paket ve algoritma SİT-SUT için standardize edilecek. 
 
   [ CORE 1 (Haberleşme & Çevre Birimleri) ]
-  - [x] PC (TTL) ve LoRa üzerinden Non-Blocking Veri Aktarımı
-  - [x] Yer İstasyonu Formatına Göre Verinin Metin (String/CSV) Olarak Parse Edilmesi (Artık TTL'de CSV basılıyor)
-  - [x] SD Karta Loglama (Kara Kutu): Verilerin uçuş esnasında kaydedilmesi
-
+   - [x] LoRa üzerinden Non-Blocking Veri Aktarımı
+   - [x] Yer İstasyonu Formatına Göre Verinin Metin (String/CSV) Olarak Parse Edilmesi
+   - [x] SD Karta Loglama (Kara Kutu): Verilerin uçuş esnasında kaydedilmesi
+   - [x] TTL devre dışı bırakıldı — pinler boş duruyor
+ 
   [ ORTAK / GENEL ]
   - [x] Sensör ve Haberleşme donanımları arası FreeRTOS Queue aktarımı
   - [x] Kalman Filtresi ekle
@@ -61,7 +63,7 @@
      - Yukarıdaki tüm veriler ve roketin kurtarma durumları (Ayrılma1/2), 
        'TelemetryPacket' isimli yapıya (struct) doldurulur.
      - Pragma pack(1) kullanıldığı için veriler bellekte boşluksuz dizilir, 
-       bu sayede yer istasyonuna (LoRa/TTL) ham (binary) ve en hızlı şekilde iletilir.
+       bu sayede yer istasyonuna (LoRa) ham (binary) ve en hızlı şekilde iletilir.
 ================================================================================
 */
 
@@ -93,7 +95,6 @@ float referans_basinc = 1013.25;
 #define PIN_SDKART_DET 35
 
 // Haberleşme Sabitleri
-#define BAUD_TTL             115200  // UART0  — PC / Yer İstasyonu (TTL)
 #define BAUD_GPS               9600  // UART2  — GY-NEO-7M GPS modülü
 #define BAUD_LORA              9600  // UART1  — E32-433T30D LoRa modülü (SX1278 tabanlı)
 #define UART_BUFFER_SIZE       1024  // TX buffer (Non-Blocking gönderim için)
@@ -102,7 +103,7 @@ float referans_basinc = 1013.25;
 // Format: [0xAA][0x55][LEN:1B][TelemetryPacket:71B][CRC16_HI:1B][CRC16_LO:1B]
 // CRC algoritması: CRC16-CCITT (poly=0x1021, init=0xFFFF)
 // Not: E32-433T30D kendi RF katmanında CRC/FEC yapıyor.
-//      Uygulama katmanı CRC'si UART/TTL hattını ve buffer kaymalarını korur.
+//      Uygulama katmanı CRC'si UART hattını ve buffer kaymalarını korur.
 #define SYNC_BYTE_1          0xAA
 #define SYNC_BYTE_2          0x55
 // FRAME_SIZE: struct sonrasında hesaplanır → sizeof(TelemetryPacket) + 2+1+2 = 76 byte
@@ -124,7 +125,6 @@ float referans_basinc = 1013.25;
 #define MAX_EGLIM             10.0  // derece - Bu açıdan fazla eğimde apogee sayılmaz (güvenlik)
 #define MIN_DIKEY_HIZ          0.0  // m/s   - Bu değerin altı (negatif) = düşüyor (BME280)
 #define KALKIS_IVME_ESIGI     20.0  // m/s²  - Z ekseninde bu ivmenin üstü = kalkış (BNO055)
-#define IMU_APOGEE_IVME_ESIGI  3.0  // m/s²  - Apogee'de Z ivmesi bu değerin altına düşer (BNO055)
 #define INIS_HIZ_ESIGI         2.0  // m/s   - Bu değerin altı = yerde sayılır
 #define INIS_IRTIFA_ESIGI     20.0  // m     - Bu irtifanın altı = yerde sayılır
 #define BNO055_MIN_KALIBRASYON 1    // 0-3 arası - Bu sistem kalibrasyon puanının altında beklenir
@@ -153,6 +153,13 @@ UcusDurumu durum = HAZIR;
 bool ayrilma1 = false;
 bool ayrilma2 = false;
 float max_irtifa_degeri = 0.0;
+
+// --- FÜNYE ZAMANLAMA (Non-Blocking) ---
+#define FUNYE_SURE_MS 400  // Fünyeye enerji verilecek süre (ms)
+unsigned long funye1_baslangic = 0;  // 0 = aktif değil
+unsigned long funye2_baslangic = 0;
+bool funye1_aktif = false;
+bool funye2_aktif = false;
 
 // --- HIZ HESAPLAMA DEĞİŞKENLERİ ---
 float onceki_irtifa = 0.0;
@@ -220,9 +227,6 @@ float basinc = 0.0, bmeSicaklik = 0.0, irtifa = 0.0, nem = 0.0;
 
 // GPS Verileri
 float gpsEnlem = 0.0, gpsBoylam = 0.0;
-float gpsIrtifa = 0.0;
-int gpsUydu = 0;
-bool gpsGecerli = false;
 
 // --- TELEMETRİ YAPISI VE KUYRUK ---
 // "pragma pack(push, 1)" struct'ın bellekte boşluksuz (padding olmadan) paketlenmesini sağlar,
@@ -247,18 +251,37 @@ File logFile;
 bool sdOk = false;
 
 // Hazır Kullanılacak Metodlar/Fonksiyonlar
+
+// Non-Blocking fünye ateşleme: Pini HIGH yapar, zamanı kaydeder.
+// 400ms sonra funye_guncelle() otomatik kapatır.
 void Funye1Atesle(){
-    digitalWrite(PIN_FUNYE_1, HIGH);
-    vTaskDelay(400 / portTICK_PERIOD_MS); 
-    digitalWrite(PIN_FUNYE_1, LOW);
-    ayrilma1 = true;
+    if (!funye1_aktif) {
+        digitalWrite(PIN_FUNYE_1, HIGH);
+        funye1_baslangic = millis();
+        funye1_aktif = true;
+        ayrilma1 = true;
+    }
 }
 
 void Funye2Atesle(){
-    digitalWrite(PIN_FUNYE_2, HIGH);
-    vTaskDelay(400 / portTICK_PERIOD_MS); 
-    digitalWrite(PIN_FUNYE_2, LOW);
-    ayrilma2 = true;
+    if (!funye2_aktif) {
+        digitalWrite(PIN_FUNYE_2, HIGH);
+        funye2_baslangic = millis();
+        funye2_aktif = true;
+        ayrilma2 = true;
+    }
+}
+
+// Her döngüde çağrılmalı — süresi dolan fünyeyi kapatır
+void funye_guncelle() {
+    if (funye1_aktif && (millis() - funye1_baslangic >= FUNYE_SURE_MS)) {
+        digitalWrite(PIN_FUNYE_1, LOW);
+        funye1_aktif = false;
+    }
+    if (funye2_aktif && (millis() - funye2_baslangic >= FUNYE_SURE_MS)) {
+        digitalWrite(PIN_FUNYE_2, LOW);
+        funye2_aktif = false;
+    }
 }
 
 // Görseldeki formüle göre Anlık Dikey Hız (Vz) Hesaplama Fonksiyonu
@@ -307,7 +330,7 @@ uint16_t crc16_ccitt(const uint8_t* data, size_t len) {
 }
 
 // --- CSV FORMATINDA (METİN) GÖNDERME ---
-// Bilgisayardan (TTL) veya SD karttan okunabilir format: veri1,veri2,veri3...
+// SD karttan okunabilir format: veri1,veri2,veri3...
 void gonder_paket_csv(Print& port, const TelemetryPacket& pkt) {
     port.print(pkt.ivmeX); port.print(",");
     port.print(pkt.ivmeY); port.print(",");
@@ -404,11 +427,11 @@ void Task1code(void *pvParameters) {
     if (gps.location.isUpdated()) {
         gpsEnlem = gps.location.lat();
         gpsBoylam = gps.location.lng();
-        gpsIrtifa = gps.altitude.meters();
-        gpsUydu = gps.satellites.value();
-        gpsGecerli = gps.location.isValid();
     }
 
+
+    // --- FÜNYE ZAMANLAMA KONTROLÜ (Non-Blocking) ---
+    funye_guncelle();
 
     // --- UÇUŞ ALGORİTMASI ---
     switch (durum) {
@@ -498,10 +521,10 @@ void Task1code(void *pvParameters) {
 
 // Core 1'de çalışacak olan görevin fonsiyonu
 // ─────────────────────────────────────────────────────────────────────────────
-// GÖREVİ: Core 0'dan gelen TelemetryPacket'i çerçeveleyip iki kanala gönderir.
+// GÖREVİ: Core 0'dan gelen TelemetryPacket'i çerçeveleyip LoRa ve SD'ye gönderir.
 //
-// TTL  (UART0 / Serial)  → PC / Yer İstasyonu     @ 115200 baud  → HER paket (~100 Hz)
 // LoRa (UART1 / Serial1) → E32-433T30D modülü     @   9600 baud  → Her 10. paket (~10 Hz)
+// SD Kart                 → Kara kutu loglama      @ CSV format   → HER paket (~100 Hz)
 //
 // ÇERÇEVE FORMATI (76 byte/paket):
 //   [0xAA][0x55][LEN=71][...TelemetryPacket 71B...][CRC16_HI][CRC16_LO]
@@ -510,8 +533,6 @@ void Task1code(void *pvParameters) {
 // E32-433T30D zaten RF katmanında CRC/FEC yapıyor; bu uygulama katmanı CRC'si.
 // ─────────────────────────────────────────────────────────────────────────────
 void Task2code(void *pvParameters) {
-  Serial.print("[CORE1] Haberlesme gorevi baslatildi, core: ");
-  Serial.println(xPortGetCoreID());
 
   TelemetryPacket incomingPacket;
   uint32_t lora_sayac = 0; // LoRa hız sınırlayıcı sayacı
@@ -520,10 +541,7 @@ void Task2code(void *pvParameters) {
     // Queue'dan paket al (CPU'yu yormadan veri gelene kadar bekler)
     if (xQueueReceive(telemetryQueue, &incomingPacket, portMAX_DELAY) == pdTRUE) {
 
-        // 1. TTL — Her paketi CSV formatında PC'ye gönder (~100 Hz)
-        gonder_paket_csv(Serial, incomingPacket);
-
-        // 2. SD Kart — Aynı veriyi karta logla (~100 Hz)
+        // 1. SD Kart — Veriyi karta logla (~100 Hz)
         if (sdOk && logFile) {
             gonder_paket_csv(logFile, incomingPacket);
             
@@ -535,7 +553,7 @@ void Task2code(void *pvParameters) {
             }
         }
 
-        // 3. LoRa (E32-433T30D) — Her LORA_GONDERIM_ORANI pakettte bir gönder (~10 Hz)
+        // 2. LoRa (E32-433T30D) — Her LORA_GONDERIM_ORANI pakettte bir gönder (~10 Hz)
         lora_sayac++;
         if (lora_sayac >= LORA_GONDERIM_ORANI) {
             gonder_paket_framed(Serial1, incomingPacket);
@@ -548,13 +566,7 @@ void Task2code(void *pvParameters) {
 }
 
 void setup() {
-    // 1. Bilgisayar Haberleşmesi
-    Serial.setTxBufferSize(UART_BUFFER_SIZE);
-    Serial.begin(BAUD_TTL, SERIAL_8N1, PIN_TTL_RX, PIN_TTL_TX);
-    delay(1000); 
-    Serial.println("--- ROKET SISTEMI BASLATILIYOR ---");
-    // CSV Header (Sütun İsimleri)
-    Serial.println("ivmeX,ivmeY,ivmeZ,gyroX,gyroY,gyroZ,roll,pitch,yaw,basinc,sicaklik,irtifa,nem,hiz,eglim,lat,lng,ayr1,ayr2,state");
+    // 1. TTL kullanılmıyor — Serial başlatılmadı, pinler boşta
 
     // 2. Pin Modları ve Güvenlik (Tasklardan ÖNCE yapılmalı)
     pinMode(PIN_FUNYE_1, OUTPUT);
@@ -573,12 +585,20 @@ void setup() {
     Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL); 
     SPI.begin(PIN_SPI_CLK, PIN_SPI_MISO, PIN_SPI_MOSI, PIN_SPI_CS);
 
+    // 4. Modül Haberleşmeleri — LoRa'yı sensörlerden ÖNCE başlat (setup mesajları için)
+    Serial2.begin(BAUD_GPS, SERIAL_8N1, PIN_GPS_RX, PIN_GPS_TX);
+    Serial1.setTxBufferSize(UART_BUFFER_SIZE);
+    Serial1.begin(BAUD_LORA, SERIAL_8N1, PIN_LORA_RX, PIN_LORA_TX);
+    delay(500); // LoRa modülünün hazır olması için kısa bekleme
+
+    Serial1.println("--- ROKET SISTEMI BASLATILIYOR ---");
+
     // SD Kart Başlatma
     if (!SD.begin(PIN_SPI_CS)) {
-        Serial.println("UYARI: SD Kart baslatilamadi! Loglama yapilmayacak.");
+        Serial1.println("UYARI: SD Kart baslatilamadi! Loglama yapilmayacak.");
         sdOk = false;
     } else {
-        Serial.println("SD Kart baslatildi.");
+        Serial1.println("SD Kart baslatildi.");
         logFile = SD.open("/ucus_log.csv", FILE_APPEND);
         if (logFile) {
             // Dosya yeni oluşturulduysa veya boşsa başlık yaz
@@ -587,41 +607,43 @@ void setup() {
             }
             sdOk = true;
         } else {
-            Serial.println("HATA: Log dosyasi acilamadi!");
+            Serial1.println("HATA: Log dosyasi acilamadi!");
             sdOk = false;
         }
     }
 
     // Sensör Başlatma İşlemleri
     if (!bno.begin()) {
-        Serial.println("KRITIK: BNO055 bulunamadi! Sistem durduruluyor.");
+        Serial1.println("KRITIK: BNO055 bulunamadi! Sistem durduruluyor.");
         while(true) { vTaskDelay(1000 / portTICK_PERIOD_MS); }
     }
-    Serial.println("BNO055 baslatildi.");
+    Serial1.println("BNO055 baslatildi.");
     // BNO055'i harici kristal kullanmaya ayarlamak okumaları daha stabil yapar
     bno.setExtCrystalUse(true);
 
     // BNO055 Kalibrasyon Kalitesi Bekleme
     // begin() başarılı olsa bile kalibrasyon dakikalar alabilir.
     // Kalibre olmamış sensorden apogee kararı vermek tehlikelidir.
-    Serial.println("BNO055 kalibrasyonu bekleniyor (sensoru hareket ettirin)...");
+    Serial1.println("BNO055 kalibrasyonu bekleniyor...");
     {
         uint8_t cal_sys = 0, cal_gyro = 0, cal_accel = 0, cal_mag = 0;
         while (cal_sys < BNO055_MIN_KALIBRASYON) {
             bno.getCalibration(&cal_sys, &cal_gyro, &cal_accel, &cal_mag);
-            Serial.printf("Kalibrasyon: Sys=%d/3  Gyro=%d/3  Accel=%d/3  Mag=%d/3\n",
-                          cal_sys, cal_gyro, cal_accel, cal_mag);
+            char buf[80];
+            snprintf(buf, sizeof(buf), "Kal: Sys=%d/3 Gyro=%d/3 Accel=%d/3 Mag=%d/3",
+                     cal_sys, cal_gyro, cal_accel, cal_mag);
+            Serial1.println(buf);
             vTaskDelay(500 / portTICK_PERIOD_MS);
         }
     }
-    Serial.println("BNO055 kalibrasyonu tamamlandi! Sistem ucusa hazir.");
+    Serial1.println("BNO055 kalibrasyonu tamamlandi!");
 
     // BME280 genelde 0x76 veya 0x77 I2C adresi kullanır
     if (!bme.begin(BME280_ADDR_PRIMARY) && !bme.begin(BME280_ADDR_SECONDARY)) {
-        Serial.println("KRITIK: BME280 bulunamadi! Sistem durduruluyor.");
+        Serial1.println("KRITIK: BME280 bulunamadi! Sistem durduruluyor.");
         while(true) { vTaskDelay(1000 / portTICK_PERIOD_MS); }
     }
-    Serial.println("BME280 baslatildi.");
+    Serial1.println("BME280 baslatildi.");
     // Gelişmiş okuma ayarları (BME280)
     bme.setSampling(Adafruit_BME280::MODE_NORMAL,
                     Adafruit_BME280::SAMPLING_X2,  // Sicaklik
@@ -632,28 +654,23 @@ void setup() {
 
     // 3.1 Ground Kalibrasyon: Anlık yer seviyesi basıncını ölç (20 örnek ortalaması)
     delay(200);
-    Serial.println("Yer kalibrasyonu yapiliyor...");
+    Serial1.println("Yer kalibrasyonu yapiliyor...");
     float basinc_toplam = 0.0;
     for (int i = 0; i < 20; i++) {
         basinc_toplam += bme.readPressure() / 100.0F; // Pascal → hPa
         delay(50);
     }
     referans_basinc = basinc_toplam / 20.0;
-    Serial.print("Referans Basinc (hPa): ");
-    Serial.println(referans_basinc);
-
-
-    // 4. Modül Haberleşmeleri
-    Serial2.begin(BAUD_GPS, SERIAL_8N1, PIN_GPS_RX, PIN_GPS_TX);
-    
-    // LoRa (UART1) TX buffer büyütülerek Task2'deki gönderimlerin Non-Blocking olması sağlanıyor
-    Serial1.setTxBufferSize(UART_BUFFER_SIZE);
-    Serial1.begin(BAUD_LORA, SERIAL_8N1, PIN_LORA_RX, PIN_LORA_TX);
+    {
+        char buf[40];
+        snprintf(buf, sizeof(buf), "Referans Basinc (hPa): %.2f", referans_basinc);
+        Serial1.println(buf);
+    }
 
     // FreeRTOS Kuyruk Başlatma (Maksimum 10 paketlik yer ayıralım)
     telemetryQueue = xQueueCreate(TELEMETRY_QUEUE_LEN, sizeof(TelemetryPacket));
     if(telemetryQueue == NULL){
-      Serial.println("KRITIK: Kuyruk olusturulamadi! Sistem durduruluyor.");
+      Serial1.println("KRITIK: Kuyruk olusturulamadi! Sistem durduruluyor.");
       while(true) { vTaskDelay(1000 / portTICK_PERIOD_MS); }
     }
 
@@ -667,7 +684,7 @@ void setup() {
     xTaskCreatePinnedToCore(
         Task2code, "HaberlesmeGörevi", TASK_STACK_SIZE, NULL, TASK2_PRIORITY, &Task2, 1); 
     
-    Serial.println("Setup Tamam. Görevler Dagiltildi.");
+    Serial1.println("Setup Tamam. Gorevler Dagitildi.");
 }
 void loop() {
   // FreeRTOS görevleri oluşturduğumuz için loop() içini genellikle boş veya
