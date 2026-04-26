@@ -5,6 +5,8 @@
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BME280.h>
 #include <TinyGPS++.h>
+#include <SD.h>
+#include <FS.h>
 /*
 ================================================================================
   YAPILACAKLAR LİSTESİ (TODO & MİMARİ PLAN)
@@ -18,8 +20,8 @@
 
   [ CORE 1 (Haberleşme & Çevre Birimleri) ]
   - [x] PC (TTL) ve LoRa üzerinden Non-Blocking Veri Aktarımı
-  - [ ] Yer İstasyonu Formatına Göre Verinin Metin (String/CSV) Olarak Parse Edilmesi (Şu an ham binary basılıyor)
-  - [ ] SD Karta Loglama (Kara Kutu): Verilerin uçuş esnasında kaydedilmesi
+  - [x] Yer İstasyonu Formatına Göre Verinin Metin (String/CSV) Olarak Parse Edilmesi (Artık TTL'de CSV basılıyor)
+  - [x] SD Karta Loglama (Kara Kutu): Verilerin uçuş esnasında kaydedilmesi
 
   [ ORTAK / GENEL ]
   - [x] Sensör ve Haberleşme donanımları arası FreeRTOS Queue aktarımı
@@ -241,6 +243,8 @@ struct TelemetryPacket {
 #pragma pack(pop)
 
 QueueHandle_t telemetryQueue;
+File logFile;
+bool sdOk = false;
 
 // Hazır Kullanılacak Metodlar/Fonksiyonlar
 void Funye1Atesle(){
@@ -302,7 +306,32 @@ uint16_t crc16_ccitt(const uint8_t* data, size_t len) {
     return crc;
 }
 
-// --- ÇERÇEVELI PAKET GÖNDERME ---
+// --- CSV FORMATINDA (METİN) GÖNDERME ---
+// Bilgisayardan (TTL) veya SD karttan okunabilir format: veri1,veri2,veri3...
+void gonder_paket_csv(Print& port, const TelemetryPacket& pkt) {
+    port.print(pkt.ivmeX); port.print(",");
+    port.print(pkt.ivmeY); port.print(",");
+    port.print(pkt.ivmeZ); port.print(",");
+    port.print(pkt.gyroX); port.print(",");
+    port.print(pkt.gyroY); port.print(",");
+    port.print(pkt.gyroZ); port.print(",");
+    port.print(pkt.roll); port.print(",");
+    port.print(pkt.pitch); port.print(",");
+    port.print(pkt.yaw); port.print(",");
+    port.print(pkt.basinc); port.print(",");
+    port.print(pkt.bmeSicaklik); port.print(",");
+    port.print(pkt.irtifa); port.print(",");
+    port.print(pkt.nem); port.print(",");
+    port.print(pkt.dikeyHiz); port.print(",");
+    port.print(pkt.eglimAcisi); port.print(",");
+    port.print(pkt.gpsEnlem, 6); port.print(","); 
+    port.print(pkt.gpsBoylam, 6); port.print(",");
+    port.print(pkt.ayrilma1_durum); port.print(",");
+    port.print(pkt.ayrilma2_durum); port.print(",");
+    port.println(pkt.ucus_durumu); // Son veri ve alt satıra geç
+}
+
+// --- ÇERÇEVELI PAKET GÖNDERME (BINARY) ---
 // Format: [SYNC1=0xAA][SYNC2=0x55][LEN=71][...71 byte payload...][CRC16_HI][CRC16_LO]
 void gonder_paket_framed(HardwareSerial& port, const TelemetryPacket& pkt) {
     const uint8_t* payload = (const uint8_t*)&pkt;
@@ -491,14 +520,22 @@ void Task2code(void *pvParameters) {
     // Queue'dan paket al (CPU'yu yormadan veri gelene kadar bekler)
     if (xQueueReceive(telemetryQueue, &incomingPacket, portMAX_DELAY) == pdTRUE) {
 
-        // 1. TTL — Her paketi çerçeveleyip PC'ye gönder (~100 Hz)
-        //    TX buffer büyük ayarlandığı için write() anında döner,
-        //    UART donanımı gönderimi interrupt'larla arka planda tamamlar.
-        gonder_paket_framed(Serial, incomingPacket);
+        // 1. TTL — Her paketi CSV formatında PC'ye gönder (~100 Hz)
+        gonder_paket_csv(Serial, incomingPacket);
 
-        // 2. LoRa (E32-433T30D) — Her LORA_GONDERIM_ORANI pakettte bir gönder (~10 Hz)
-        //    Neden? 9600 baud @ 76 byte = ~78ms/paket → max ~12.8 paket/sn.
-        //    100 Hz queue hızında tümü gönderilseydi TX buffer taşardı.
+        // 2. SD Kart — Aynı veriyi karta logla (~100 Hz)
+        if (sdOk && logFile) {
+            gonder_paket_csv(logFile, incomingPacket);
+            
+            // Güvenlik: Her 50 pakette bir (yaklaşık 0.5sn) dosyayı fiziksel olarak kaydet
+            static int flush_sayac = 0;
+            if (++flush_sayac >= 50) {
+                logFile.flush();
+                flush_sayac = 0;
+            }
+        }
+
+        // 3. LoRa (E32-433T30D) — Her LORA_GONDERIM_ORANI pakettte bir gönder (~10 Hz)
         lora_sayac++;
         if (lora_sayac >= LORA_GONDERIM_ORANI) {
             gonder_paket_framed(Serial1, incomingPacket);
@@ -516,6 +553,8 @@ void setup() {
     Serial.begin(BAUD_TTL, SERIAL_8N1, PIN_TTL_RX, PIN_TTL_TX);
     delay(1000); 
     Serial.println("--- ROKET SISTEMI BASLATILIYOR ---");
+    // CSV Header (Sütun İsimleri)
+    Serial.println("ivmeX,ivmeY,ivmeZ,gyroX,gyroY,gyroZ,roll,pitch,yaw,basinc,sicaklik,irtifa,nem,hiz,eglim,lat,lng,ayr1,ayr2,state");
 
     // 2. Pin Modları ve Güvenlik (Tasklardan ÖNCE yapılmalı)
     pinMode(PIN_FUNYE_1, OUTPUT);
@@ -533,6 +572,25 @@ void setup() {
     // 3. Protokoller
     Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL); 
     SPI.begin(PIN_SPI_CLK, PIN_SPI_MISO, PIN_SPI_MOSI, PIN_SPI_CS);
+
+    // SD Kart Başlatma
+    if (!SD.begin(PIN_SPI_CS)) {
+        Serial.println("UYARI: SD Kart baslatilamadi! Loglama yapilmayacak.");
+        sdOk = false;
+    } else {
+        Serial.println("SD Kart baslatildi.");
+        logFile = SD.open("/ucus_log.csv", FILE_APPEND);
+        if (logFile) {
+            // Dosya yeni oluşturulduysa veya boşsa başlık yaz
+            if (logFile.size() == 0) {
+                logFile.println("ivmeX,ivmeY,ivmeZ,gyroX,gyroY,gyroZ,roll,pitch,yaw,basinc,sicaklik,irtifa,nem,hiz,eglim,lat,lng,ayr1,ayr2,state");
+            }
+            sdOk = true;
+        } else {
+            Serial.println("HATA: Log dosyasi acilamadi!");
+            sdOk = false;
+        }
+    }
 
     // Sensör Başlatma İşlemleri
     if (!bno.begin()) {

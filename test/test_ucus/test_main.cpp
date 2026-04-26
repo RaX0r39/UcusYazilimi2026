@@ -14,8 +14,10 @@
  */
 
 #include <unity.h>
+#include <Arduino.h>
 #include <math.h>
 #include <stdint.h>
+#include <SD.h>
 
 // ============================================================
 // BAĞIMLILIK GEREKTİRMEYEN KOD KOPYALARI
@@ -109,6 +111,41 @@ float hesapla_eglim_acisi(float pitch_deg, float roll_deg) {
     if (cos_val < -1.0f) cos_val = -1.0f;
     return acosf(cos_val) * RAD_TO_DEG;
 }
+
+// --- CSV FORMATINDA (METİN) GÖNDERME ---
+void gonder_paket_csv(Print& port, const TelemetryPacket& pkt) {
+    port.print(pkt.ivmeX); port.print(",");
+    port.print(pkt.ivmeY); port.print(",");
+    port.print(pkt.ivmeZ); port.print(",");
+    port.print(pkt.gyroX); port.print(",");
+    port.print(pkt.gyroY); port.print(",");
+    port.print(pkt.gyroZ); port.print(",");
+    port.print(pkt.roll); port.print(",");
+    port.print(pkt.pitch); port.print(",");
+    port.print(pkt.yaw); port.print(",");
+    port.print(pkt.basinc); port.print(",");
+    port.print(pkt.bmeSicaklik); port.print(",");
+    port.print(pkt.irtifa); port.print(",");
+    port.print(pkt.nem); port.print(",");
+    port.print(pkt.dikeyHiz); port.print(",");
+    port.print(pkt.eglimAcisi); port.print(",");
+    port.print(pkt.gpsEnlem, 6); port.print(","); 
+    port.print(pkt.gpsBoylam, 6); port.print(",");
+    port.print(pkt.ayrilma1_durum); port.print(",");
+    port.print(pkt.ayrilma2_durum); port.print(",");
+    port.println(pkt.ucus_durumu);
+}
+
+// --- MOCK PRINTER (Test için) ---
+class MockPrinter : public Print {
+public:
+    String output = "";
+    size_t write(uint8_t c) override {
+        output += (char)c;
+        return 1;
+    }
+    void clear() { output = ""; }
+};
 
 // --- CRC16-CCITT ---
 uint16_t crc16_ccitt(const uint8_t* data, size_t len) {
@@ -292,6 +329,21 @@ void test_telemetry_frame_boyutu(void) {
     // [0xAA][0x55][LEN=71][PAYLOAD=71][CRC_HI][CRC_LO] = 76 byte
     TEST_ASSERT_EQUAL_INT(71, sizeof(TelemetryPacket));
     TEST_ASSERT_EQUAL_INT(76, FRAME_SIZE);
+}
+
+void test_csv_format_dogrulugu(void) {
+    TelemetryPacket p;
+    memset(&p, 0, sizeof(p));
+    p.ivmeX = 1.23f;
+    p.irtifa = 100.0f;
+    p.ucus_durumu = 1;
+
+    MockPrinter mp;
+    gonder_paket_csv(mp, p);
+
+    // İlk değer ivmeX (1.23) olmalı, son değer ucus_durumu (1) olmalı
+    TEST_ASSERT_TRUE(mp.output.startsWith("1.23,"));
+    TEST_ASSERT_TRUE(mp.output.endsWith(",1\r\n") || mp.output.endsWith(",1\n"));
 }
 
 // ============================================================
@@ -494,6 +546,7 @@ void setup() {
     RUN_TEST(test_telemetry_ucus_durumu_sinirlar);
     RUN_TEST(test_crc16_ccitt_dogrulama);
     RUN_TEST(test_telemetry_frame_boyutu);
+    RUN_TEST(test_csv_format_dogrulugu);
 
     // --- State Machine ---
     RUN_TEST(test_sm_hazir_kalkis_tespiti);
