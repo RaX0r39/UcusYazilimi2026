@@ -33,8 +33,7 @@
   - [ ] Buzzer ve LED uyarı sistemlerinin uçuş evrelerine (State) bağlanması
 
   [ PERFORMANS / OPTİMİZASYON ]
-  - [ ] DMA'nın daha iyi implemente edilmesi
-  - [ ] TelemetryPacket kısmının optimize edilmesi
+  - [x] DMA'nın daha iyi implemente edilmesi
 ================================================================================
 */
 
