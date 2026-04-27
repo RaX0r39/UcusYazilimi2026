@@ -17,7 +17,6 @@
   - [x] Fünye (Ateşleme) Kontrollerinin durum makinesi (State Machine) ile yapılması
   - [x] Kalibrasyon ve Başlangıç İrtifası / Basıncı referans alımı
   - [ ] BNO055 Z-Ekseni Yön Kalibrasyonu (Şu an Z ekseni yukarı varsayılıyor, doğrulanmalı!)
-  - [ ] Paket ve algoritma SİT-SUT için standardize edilecek. 
 
   [ CORE 1 (Haberleşme & Çevre Birimleri) ]
    - [x] LoRa üzerinden Non-Blocking Veri Aktarımı
