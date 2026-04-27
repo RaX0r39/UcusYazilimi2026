@@ -7,6 +7,8 @@
 #include <TinyGPS++.h>
 #include <SD.h>
 #include <FS.h>
+#include "driver/uart.h"      // DMA destekli UART sürücüsü
+#include "esp_heap_caps.h"    // DMA uyumlu bellek yönetimi
 /*
 ================================================================================
   YAPILACAKLAR LİSTESİ (TODO & MİMARİ PLAN)
@@ -245,6 +247,16 @@ struct TelemetryPacket {
 };
 #pragma pack(pop)
 
+// DMA uyumlu telemetri paketi pointer'ı
+TelemetryPacket* dma_packet; 
+
+// SD Kart Ping-Pong Buffer Tanımları
+#define SD_DMA_BUF_SIZE 512
+char* sd_dma_buf_A;
+char* sd_dma_buf_B;
+volatile int active_sd_buf = 0; // 0: A, 1: B
+volatile int sd_buf_idx = 0;
+
 QueueHandle_t telemetryQueue;
 File logFile;
 bool sdOk = false;
@@ -328,45 +340,58 @@ uint16_t crc16_ccitt(const uint8_t* data, size_t len) {
     return crc;
 }
 
-// --- CSV FORMATINDA (METİN) GÖNDERME ---
-// SD karttan okunabilir format: veri1,veri2,veri3...
-void gonder_paket_csv(Print& port, const TelemetryPacket& pkt) {
-    port.print(pkt.ivmeX); port.print(",");
-    port.print(pkt.ivmeY); port.print(",");
-    port.print(pkt.ivmeZ); port.print(",");
-    port.print(pkt.gyroX); port.print(",");
-    port.print(pkt.gyroY); port.print(",");
-    port.print(pkt.gyroZ); port.print(",");
-    port.print(pkt.roll); port.print(",");
-    port.print(pkt.pitch); port.print(",");
-    port.print(pkt.yaw); port.print(",");
-    port.print(pkt.basinc); port.print(",");
-    port.print(pkt.bmeSicaklik); port.print(",");
-    port.print(pkt.irtifa); port.print(",");
-    port.print(pkt.nem); port.print(",");
-    port.print(pkt.dikeyHiz); port.print(",");
-    port.print(pkt.eglimAcisi); port.print(",");
-    port.print(pkt.gpsEnlem, 6); port.print(","); 
-    port.print(pkt.gpsBoylam, 6); port.print(",");
-    port.print(pkt.ayrilma1_durum); port.print(",");
-    port.print(pkt.ayrilma2_durum); port.print(",");
-    port.println(pkt.ucus_durumu); // Son veri ve alt satıra geç
+// --- BUFFERLI (PING-PONG) SD YAZMA ---
+void bufferla_ve_yaz_sd(File& file, const TelemetryPacket& pkt) {
+    char temp_line[160];
+    // Paketi CSV satırına dönüştür
+    int line_len = snprintf(temp_line, sizeof(temp_line), 
+        "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.6f,%.6f,%d,%d,%d\n",
+        pkt.ivmeX, pkt.ivmeY, pkt.ivmeZ, pkt.gyroX, pkt.gyroY, pkt.gyroZ,
+        pkt.roll, pkt.pitch, pkt.yaw, pkt.basinc, pkt.bmeSicaklik,
+        pkt.irtifa, pkt.nem, pkt.dikeyHiz, pkt.eglimAcisi,
+        pkt.gpsEnlem, pkt.gpsBoylam, pkt.ayrilma1_durum, pkt.ayrilma2_durum, pkt.ucus_durumu);
+
+    char* current_buf = (active_sd_buf == 0) ? sd_dma_buf_A : sd_dma_buf_B;
+
+    // Eğer yeni satır mevcut tampona sığmıyorsa, tamponu boşalt (Ping-Pong)
+    if (sd_buf_idx + line_len >= SD_DMA_BUF_SIZE) {
+        // Mevcut tamponu SD karta toplu (DMA dostu) olarak bas
+        if (file) {
+            file.write((const uint8_t*)current_buf, sd_buf_idx);
+            // file.flush(); // Performans için her seferinde flush yapmıyoruz
+        }
+        
+        // Tampon değiştir (Ping-Pong)
+        active_sd_buf = (active_sd_buf == 0) ? 1 : 0;
+        current_buf = (active_sd_buf == 0) ? sd_dma_buf_A : sd_dma_buf_B;
+        sd_buf_idx = 0;
+    }
+
+    // Veriyi aktif tampona kopyala
+    memcpy(&current_buf[sd_buf_idx], temp_line, line_len);
+    sd_buf_idx += line_len;
 }
 
-// --- ÇERÇEVELI PAKET GÖNDERME (BINARY) ---
-// Format: [SYNC1=0xAA][SYNC2=0x55][LEN=71][...71 byte payload...][CRC16_HI][CRC16_LO]
-void gonder_paket_framed(HardwareSerial& port, const TelemetryPacket& pkt) {
+// --- ÇERÇEVELI PAKET GÖNDERME (DMA DESTEKLI UART) ---
+void gonder_paket_framed_dma(uart_port_t uart_num, const TelemetryPacket& pkt) {
+    static uint8_t frame_buf[80]; // DMA uyumlu buffer (statik bellek genelde DMA erişimine uygundur)
+    
     const uint8_t* payload = (const uint8_t*)&pkt;
-    const size_t   len     = sizeof(TelemetryPacket); // 71
+    const size_t   len     = sizeof(TelemetryPacket);
     uint16_t       crc     = crc16_ccitt(payload, len);
 
-    port.write(SYNC_BYTE_1);       // 0xAA
-    port.write(SYNC_BYTE_2);       // 0x55
-    port.write((uint8_t)len);      // 71
-    port.write(payload, len);      // TelemetryPacket (ham binary)
-    port.write((uint8_t)(crc >> 8));   // CRC16 high byte
-    port.write((uint8_t)(crc & 0xFF)); // CRC16 low byte
-    // Toplam: 76 byte/çerçeve
+    size_t idx = 0;
+    frame_buf[idx++] = SYNC_BYTE_1;
+    frame_buf[idx++] = SYNC_BYTE_2;
+    frame_buf[idx++] = (uint8_t)len;
+    memcpy(&frame_buf[idx], payload, len);
+    idx += len;
+    frame_buf[idx++] = (uint8_t)(crc >> 8);
+    frame_buf[idx++] = (uint8_t)(crc & 0xFF);
+
+    // uart_write_bytes: Veriyi dahili halka tampona (ring buffer) atar ve hemen döner.
+    // Arka plandaki UART donanımı veriyi asenkron olarak (DMA-like) gönderir.
+    uart_write_bytes(uart_num, (const char*)frame_buf, idx);
 }
 
 // Core 0'da çalışacak olan görevin fonsiyonu
@@ -540,22 +565,22 @@ void Task2code(void *pvParameters) {
     // Queue'dan paket al (CPU'yu yormadan veri gelene kadar bekler)
     if (xQueueReceive(telemetryQueue, &incomingPacket, portMAX_DELAY) == pdTRUE) {
 
-        // 1. SD Kart — Veriyi karta logla (~100 Hz)
+        // 1. SD Kart — Ping-Pong Buffer ile Logla (~100 Hz)
         if (sdOk && logFile) {
-            gonder_paket_csv(logFile, incomingPacket);
+            bufferla_ve_yaz_sd(logFile, incomingPacket);
             
-            // Güvenlik: Her 50 pakette bir (yaklaşık 0.5sn) dosyayı fiziksel olarak kaydet
+            // Periyodik Flush (Gerçekten SD karta yazılması için)
             static int flush_sayac = 0;
-            if (++flush_sayac >= 50) {
+            if (++flush_sayac >= 100) { // Her 1 saniyede bir fiziksel kayıt
                 logFile.flush();
                 flush_sayac = 0;
             }
         }
 
-        // 2. LoRa (E32-433T30D) — Her LORA_GONDERIM_ORANI pakettte bir gönder (~10 Hz)
+        // 2. LoRa (E32-433T30D) — Asenkron DMA Gönderimi (~10 Hz)
         lora_sayac++;
         if (lora_sayac >= LORA_GONDERIM_ORANI) {
-            gonder_paket_framed(Serial1, incomingPacket);
+            gonder_paket_framed_dma(UART_NUM_1, incomingPacket);
             lora_sayac = 0;
         }
     }
@@ -580,17 +605,33 @@ void setup() {
     pinMode(PIN_LED_3, OUTPUT);
     pinMode(PIN_SDKART_DET, INPUT_PULLUP); // SD kart algılama genelde pull-up gerektirir
 
-    // 3. Protokoller
+    // 3. Protokoller ve DMA Bellek Tahsisi
+    sd_dma_buf_A = (char*)heap_caps_malloc(SD_DMA_BUF_SIZE, MALLOC_CAP_DMA);
+    sd_dma_buf_B = (char*)heap_caps_malloc(SD_DMA_BUF_SIZE, MALLOC_CAP_DMA);
+    
     Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL); 
     SPI.begin(PIN_SPI_CLK, PIN_SPI_MISO, PIN_SPI_MOSI, PIN_SPI_CS);
 
-    // 4. Modül Haberleşmeleri — LoRa'yı sensörlerden ÖNCE başlat (setup mesajları için)
+    // 4. Modül Haberleşmeleri — LoRa'yı sensörlerden ÖNCE başlat
     Serial2.begin(BAUD_GPS, SERIAL_8N1, PIN_GPS_RX, PIN_GPS_TX);
-    Serial1.setTxBufferSize(UART_BUFFER_SIZE);
-    Serial1.begin(BAUD_LORA, SERIAL_8N1, PIN_LORA_RX, PIN_LORA_TX);
-    delay(500); // LoRa modülünün hazır olması için kısa bekleme
+    
+    // LoRa (UART1) DMA Yapılandırması
+    uart_config_t uart_config = {
+        .baud_rate = BAUD_LORA,
+        .data_bits = UART_DATA_8_BITS,
+        .parity    = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE
+    };
+    // Sürücüyü kur: 2048 byte RX buffer, 2048 byte TX buffer (DMA asenkronluğu için)
+    uart_driver_install(UART_NUM_1, 2048, 2048, 0, NULL, 0);
+    uart_param_config(UART_NUM_1, &uart_config);
+    uart_set_pin(UART_NUM_1, PIN_LORA_TX, PIN_LORA_RX, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
 
-    Serial1.println("--- ROKET SISTEMI BASLATILIYOR ---");
+    delay(500); 
+    
+    const char* start_msg = "--- ROKET SISTEMI BASLATILIYOR (DMA ACTIVE) ---\n";
+    uart_write_bytes(UART_NUM_1, start_msg, strlen(start_msg));
 
     // SD Kart Başlatma
     if (!SD.begin(PIN_SPI_CS)) {
