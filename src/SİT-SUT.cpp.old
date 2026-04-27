@@ -7,35 +7,7 @@
 #include <TinyGPS++.h>
 #include <SD.h>
 #include <FS.h>
-/*
-================================================================================
-  YAPILACAKLAR LİSTESİ (TODO & MİMARİ PLAN)
-================================================================================
-  [ CORE 0 (Uçuş Kontrolü & Kritik İşlemler) ]
-  - [x] Sensör Verilerinin Okunması (BNO055, BME280, GPS)
-  - [x] Uçuş Algoritması (Apogee tespiti, serbest düşüş anlama vb.)
-  - [x] Fünye (Ateşleme) Kontrollerinin durum makinesi (State Machine) ile yapılması
-  - [x] Kalibrasyon ve Başlangıç İrtifası / Basıncı referans alımı
-  - [ ] BNO055 Z-Ekseni Yön Kalibrasyonu (Şu an Z ekseni yukarı varsayılıyor, doğrulanmalı!)
-  - [ ] Paket ve algoritma SİT-SUT için standardize edilecek. 
 
-  [ CORE 1 (Haberleşme & Çevre Birimleri) ]
-   - [x] LoRa üzerinden Non-Blocking Veri Aktarımı
-   - [x] Yer İstasyonu Formatına Göre Verinin Metin (String/CSV) Olarak Parse Edilmesi
-   - [x] SD Karta Loglama (Kara Kutu): Verilerin uçuş esnasında kaydedilmesi
-   - [x] TTL devre dışı bırakıldı — pinler boş duruyor
- 
-  [ ORTAK / GENEL ]
-  - [x] Sensör ve Haberleşme donanımları arası FreeRTOS Queue aktarımı
-  - [x] Kalman Filtresi ekle
-  - [x] Kurtarma Sistemi Durum (Ayrılma1/Ayrılma2) bayraklarının haberleşme paketine doğru işlenmesi
-  - [ ] Buzzer ve LED uyarı sistemlerinin uçuş evrelerine (State) bağlanması
-
-  [ PERFORMANS / OPTİMİZASYON ]
-  - [ ] DMA'nın daha iyi implemente edilmesi
-  - [ ] TelemetryPacket kısmının optimize edilmesi
-================================================================================
-*/
 
 /*
 ================================================================================
@@ -97,6 +69,7 @@ float referans_basinc = 1013.25;
 // Haberleşme Sabitleri
 #define BAUD_GPS               9600  // UART2  — GY-NEO-7M GPS modülü
 #define BAUD_LORA              9600  // UART1  — E32-433T30D LoRa modülü (SX1278 tabanlı)
+#define BAUD_TTL               9600  // UART0  — SİT/SUT komut alma (TTL)
 #define UART_BUFFER_SIZE       1024  // TX buffer (Non-Blocking gönderim için)
 
 // --- ÇERÇEVE PROTOKOLü (Framed Binary) ---
@@ -112,6 +85,21 @@ float referans_basinc = 1013.25;
 // E32-433T30D @ 9600 baud, 76 byte/çerçeve → ~12.6 çerçeve/sn max
 // Core 0 queue → 100 Hz; LoRa → her LORA_GONDERIM_ORANI pakettte bir (≈10 Hz)
 #define LORA_GONDERIM_ORANI    10
+
+// --- SİT/SUT KOMUT PROTOKOLÜ ---
+// Format: [HEADER:0xAA][COMMAND:1B][CHECKSUM:1B][FOOTER1:0x0D][FOOTER2:0x0A]
+// Checksum = Command + 0x6C (tabloya göre doğrulanmış)
+#define SITSUT_HEADER        0xAA
+#define SITSUT_DATA_HEADER   0xAB
+#define SITSUT_FOOTER1       0x0D
+#define SITSUT_FOOTER2       0x0A
+#define SITSUT_PAKET_BOYUT   5
+#define SITSUT_DATA_BOYUT    36
+#define SITSUT_CHK_OFFSET    0x6C  // Checksum = CMD + bu offset
+
+#define CMD_SIT_BASLAT       0x20  // Sensör İzleme Testi Başlat
+#define CMD_SUT_BASLAT       0x22  // Sentetik Uçuş Testi Başlat
+#define CMD_DURDUR           0x24  // Testi Durdur
 
 // Sensör Sabitleri
 #define BNO055_DEF 55
@@ -148,6 +136,14 @@ enum UcusDurumu {
     INDI       = 4  // Yere iniş tamamlandı, sistem pasif
 };
 UcusDurumu durum = HAZIR;
+
+// SİT/SUT Mod Durum Makinesi (Core 1 tarafından yönetilir)
+enum SitSutModu {
+    MOD_BEKLEME   = 0, // Komut bekleniyor, test aktif değil
+    MOD_SIT       = 1, // Sensör İzleme Testi aktif
+    MOD_SUT       = 2  // Sentetik Uçuş Testi aktif
+};
+volatile SitSutModu sitSutMod = MOD_BEKLEME;
 
 //Uçuş Algoritması İçin Gerekli Değişkenler
 bool ayrilma1 = false;
@@ -245,6 +241,27 @@ struct TelemetryPacket {
     uint8_t ucus_durumu; // Uçuş evresi: 0=Hazır, 1=Yükseliyor, 2=İniş1, 3=İniş2, 4=İndi
 };
 #pragma pack(pop)
+
+// --- SİT TELEMETRİ PAKETİ (Tablo 3 — 36 byte) ---
+// Format: [0xAB][İRTİFA:4B][BASINÇ:4B][İVME_X:4B][İVME_Y:4B][İVME_Z:4B]
+//         [AÇI_X:4B][AÇI_Y:4B][AÇI_Z:4B][CHK:1B][0x0D][0x0A]
+#pragma pack(push, 1)
+struct SitPaketi {
+    uint8_t header;     // Byte 1  — 0xAB
+    float   irtifa;     // Byte 2-5
+    float   basinc;     // Byte 6-9
+    float   ivmeX;      // Byte 10-13
+    float   ivmeY;      // Byte 14-17
+    float   ivmeZ;      // Byte 18-21
+    float   aciX;       // Byte 22-25 (Roll)
+    float   aciY;       // Byte 26-29 (Pitch)
+    float   aciZ;       // Byte 30-33 (Yaw)
+    uint8_t checksum;   // Byte 34
+    uint8_t footer1;    // Byte 35 — 0x0D
+    uint8_t footer2;    // Byte 36 — 0x0A
+};
+#pragma pack(pop)
+// sizeof(SitPaketi) = 36 byte
 
 QueueHandle_t telemetryQueue;
 File logFile;
@@ -370,6 +387,34 @@ void gonder_paket_framed(HardwareSerial& port, const TelemetryPacket& pkt) {
     // Toplam: 76 byte/çerçeve
 }
 
+// --- SİT PAKETİ GÖNDERME (TTL / UART0 / Serial) ---
+// Tablo 3'e göre 36 byte binary paket — Core 0'dan çağrılır
+// Checksum: Payload byte'larının toplamı (header ve footer hariç), low byte
+void gonder_sit_paketi() {
+    SitPaketi pkt;
+    pkt.header  = 0xAB;
+    pkt.irtifa  = irtifa;
+    pkt.basinc  = basinc;
+    pkt.ivmeX   = ivmeX;
+    pkt.ivmeY   = ivmeY;
+    pkt.ivmeZ   = ivmeZ;
+    pkt.aciX    = roll;   // AÇI X = Roll
+    pkt.aciY    = pitch;  // AÇI Y = Pitch
+    pkt.aciZ    = yaw;    // AÇI Z = Yaw
+
+    // Checksum hesapla: 8 float (32 byte) payload toplamı
+    uint8_t chk = 0;
+    const uint8_t* payload = (const uint8_t*)&pkt.irtifa;
+    for (size_t i = 0; i < 32; i++) {
+        chk += payload[i];
+    }
+    pkt.checksum = chk;
+    pkt.footer1  = 0x0D;
+    pkt.footer2  = 0x0A;
+
+    Serial.write((const uint8_t*)&pkt, sizeof(SitPaketi));
+}
+
 // Core 0'da çalışacak olan görevin fonsiyonu
 void Task1code(void *pvParameters) {
  
@@ -379,55 +424,55 @@ void Task1code(void *pvParameters) {
     // KENDI KODUNUZU BURAYA YAZIN (CORE 0 - SÜREKLİ DÖNGÜ)
     // ----------------------------------------------------
 
-    // 1. IMU (BNO055) Verilerini Okuma
-    sensors_event_t a, g, o;
-    // İvme (Linear Acceleration - Yerçekimi hariç)
-    bno.getEvent(&a, Adafruit_BNO055::VECTOR_LINEARACCEL);
-    ivmeX = kf_ivmeX.updateEstimate(a.acceleration.x);
-    ivmeY = kf_ivmeY.updateEstimate(a.acceleration.y);
-    ivmeZ = kf_ivmeZ.updateEstimate(a.acceleration.z);
+    // 1. Sensör Verilerini Okuma (SUT modunda değilsek donanımdan oku)
+    if (sitSutMod != MOD_SUT) {
+        sensors_event_t a, g, o;
+        // İvme (Linear Acceleration - Yerçekimi hariç)
+        bno.getEvent(&a, Adafruit_BNO055::VECTOR_LINEARACCEL);
+        ivmeX = kf_ivmeX.updateEstimate(a.acceleration.x);
+        ivmeY = kf_ivmeY.updateEstimate(a.acceleration.y);
+        ivmeZ = kf_ivmeZ.updateEstimate(a.acceleration.z);
 
-    // Jiroskop
-    bno.getEvent(&g, Adafruit_BNO055::VECTOR_GYROSCOPE);
-    gyroX = kf_gyroX.updateEstimate(g.gyro.x);
-    gyroY = kf_gyroY.updateEstimate(g.gyro.y);
-    gyroZ = kf_gyroZ.updateEstimate(g.gyro.z);
+        // Jiroskop
+        bno.getEvent(&g, Adafruit_BNO055::VECTOR_GYROSCOPE);
+        gyroX = kf_gyroX.updateEstimate(g.gyro.x);
+        gyroY = kf_gyroY.updateEstimate(g.gyro.y);
+        gyroZ = kf_gyroZ.updateEstimate(g.gyro.z);
 
-    // Euler Açıları (Yönelim)
-    bno.getEvent(&o, Adafruit_BNO055::VECTOR_EULER);
-    yaw = kf_yaw.updateEstimate(o.orientation.x);
-    roll = kf_roll.updateEstimate(o.orientation.y);
-    pitch = kf_pitch.updateEstimate(o.orientation.z);
+        // Euler Açıları (Yönelim)
+        bno.getEvent(&o, Adafruit_BNO055::VECTOR_EULER);
+        yaw = kf_yaw.updateEstimate(o.orientation.x);
+        roll = kf_roll.updateEstimate(o.orientation.y);
+        pitch = kf_pitch.updateEstimate(o.orientation.z);
 
-    // Roketin yere göre eğim açısını (Tilt Angle) hesapla (0 = Tam dik)
+        // 2. Barometre (BME280) Verilerini Okuma
+        bmeSicaklik = kf_bmeSicaklik.updateEstimate(bme.readTemperature());
+        basinc = kf_basinc.updateEstimate(bme.readPressure());
+        nem = kf_nem.updateEstimate(bme.readHumidity());
+        irtifa = kf_irtifa.updateEstimate(bme.readAltitude(referans_basinc));
+
+        // 3. GPS Verilerini Okuma
+        while (Serial2.available() > 0) {
+            gps.encode(Serial2.read());
+        }
+        if (gps.location.isUpdated()) {
+            gpsEnlem = gps.location.lat();
+            gpsBoylam = gps.location.lng();
+        }
+    } else {
+        // MOD_SUT AKTİF: Donanım okuması atlandı. 
+        // Değişkenler Core 1 tarafından TTL üzerinden güncelleniyor.
+    }
+
+    // Roketin yere göre eğim açısını (Tilt Angle) hesapla
     float p_rad = pitch * DEG_TO_RAD;
     float r_rad = roll * DEG_TO_RAD;
-    // [FIX] Kalman gürültüsü cos(p)*cos(r)'yi 1.0'ı aşabilir → acos(NaN) → apogee asla tetiklenmez
     float cos_val = cos(p_rad) * cos(r_rad);
     cos_val = constrain(cos_val, -1.0f, 1.0f);
     eglim_acisi = acos(cos_val) * RAD_TO_DEG;
 
-    // 2. Barometre (BME280) Verilerini Okuma
-    bmeSicaklik = kf_bmeSicaklik.updateEstimate(bme.readTemperature());
-    basinc = kf_basinc.updateEstimate(bme.readPressure());
-    nem = kf_nem.updateEstimate(bme.readHumidity());
-    // referans_basinc: setup() içinde BME280'den otomatik kalibre edildi
-    irtifa = kf_irtifa.updateEstimate(bme.readAltitude(referans_basinc));
-
     // Anlık dikey hızı (Vz) hesapla
     anlik_dikey_hiz = hesapla_dikey_hiz(irtifa);
-
-    // 3. GPS Verilerini Okuma
-    // Serial2 üzerinden gelen verileri TinyGPS++ nesnesine besliyoruz
-    while (Serial2.available() > 0) {
-        gps.encode(Serial2.read());
-    }
-    
-    // GPS konumu güncellendiyse değişkenlere alıyoruz
-    if (gps.location.isUpdated()) {
-        gpsEnlem = gps.location.lat();
-        gpsBoylam = gps.location.lng();
-    }
 
 
     // --- FÜNYE ZAMANLAMA KONTROLÜ (Non-Blocking) ---
@@ -497,6 +542,11 @@ void Task1code(void *pvParameters) {
             break;
     }
 
+    // --- SİT MODU: Sensör verisini TTL üzerinden binary olarak gönder ---
+    if (sitSutMod == MOD_SIT) {
+        gonder_sit_paketi(); // Tablo 3 formatında 36 byte paket → Serial (UART0)
+    }
+
     // --- STRUCT DOLDURMA VE CORE 1'E GÖNDERME ---
     TelemetryPacket packet;
     packet.ivmeX = ivmeX; packet.ivmeY = ivmeY; packet.ivmeZ = ivmeZ;
@@ -521,31 +571,107 @@ void Task1code(void *pvParameters) {
 
 // Core 1'de çalışacak olan görevin fonsiyonu
 // ─────────────────────────────────────────────────────────────────────────────
-// GÖREVİ: Core 0'dan gelen TelemetryPacket'i çerçeveleyip LoRa ve SD'ye gönderir.
+// GÖREVİ:
+//   1. TTL (UART0/Serial) üzerinden SİT/SUT komutlarını okur ve parse eder
+//   2. Komuta göre mod durum makinesini günceller (MOD_BEKLEME / MOD_SIT / MOD_SUT)
+//   3. Core 0'dan gelen TelemetryPacket'i çerçeveleyip LoRa ve SD'ye gönderir
 //
-// LoRa (UART1 / Serial1) → E32-433T30D modülü     @   9600 baud  → Her 10. paket (~10 Hz)
-// SD Kart                 → Kara kutu loglama      @ CSV format   → HER paket (~100 Hz)
+// TTL (UART0 / Serial)  → SİT/SUT komut alımı      @  9600 baud
+// LoRa (UART1 / Serial1) → E32-433T30D modülü      @  9600 baud  → Her 10. paket (~10 Hz)
+// SD Kart                 → Kara kutu loglama       @ CSV format  → HER paket (~100 Hz)
 //
-// ÇERÇEVE FORMATI (76 byte/paket):
-//   [0xAA][0x55][LEN=71][...TelemetryPacket 71B...][CRC16_HI][CRC16_LO]
-//
-// CRC16-CCITT: UART hattında bit flip / buffer kayması tespiti.
-// E32-433T30D zaten RF katmanında CRC/FEC yapıyor; bu uygulama katmanı CRC'si.
+// SİT/SUT KOMUT FORMATI (5 byte):
+//   [HEADER=0xAA][COMMAND][CHECKSUM][0x0D][0x0A]
 // ─────────────────────────────────────────────────────────────────────────────
 void Task2code(void *pvParameters) {
 
   TelemetryPacket incomingPacket;
-  uint32_t lora_sayac = 0; // LoRa hız sınırlayıcı sayacı
+  uint32_t lora_sayac = 0;
+
+  // TTL komut/veri okuma buffer'ı
+  uint8_t ttl_buf[SITSUT_DATA_BOYUT]; // Max 36 byte
+  uint8_t ttl_idx = 0;
+  uint8_t beklenen_boyut = SITSUT_PAKET_BOYUT;
 
   for (;;) {
-    // Queue'dan paket al (CPU'yu yormadan veri gelene kadar bekler)
-    if (xQueueReceive(telemetryQueue, &incomingPacket, portMAX_DELAY) == pdTRUE) {
 
-        // 1. SD Kart — Veriyi karta logla (~100 Hz)
+    // ─── 1. TTL OKUMA (Komutlar ve SUT Verisi) ────────────────────────
+    while (Serial.available() > 0) {
+      uint8_t b = Serial.read();
+
+      if (ttl_idx == 0) {
+        if (b == SITSUT_HEADER) {
+            beklenen_boyut = SITSUT_PAKET_BOYUT; // 5
+            ttl_buf[ttl_idx++] = b;
+        } else if (b == SITSUT_DATA_HEADER) {
+            beklenen_boyut = SITSUT_DATA_BOYUT;  // 36
+            ttl_buf[ttl_idx++] = b;
+        }
+      } else {
+        ttl_buf[ttl_idx++] = b;
+
+        if (ttl_idx >= beklenen_boyut) {
+          // PAKET TİPİ: KOMUT (5 Byte)
+          if (beklenen_boyut == SITSUT_PAKET_BOYUT) {
+              uint8_t cmd = ttl_buf[1];
+              uint8_t chk = ttl_buf[2];
+              if (ttl_buf[3] == SITSUT_FOOTER1 && ttl_buf[4] == SITSUT_FOOTER2 && chk == (uint8_t)(cmd + SITSUT_CHK_OFFSET)) {
+                  switch (cmd) {
+                      case CMD_SIT_BASLAT: sitSutMod = MOD_SIT; Serial1.println("[SIT] BASLADI"); break;
+                      case CMD_SUT_BASLAT: sitSutMod = MOD_SUT; Serial1.println("[SUT] BASLADI"); break;
+                      case CMD_DURDUR:     sitSutMod = MOD_BEKLEME; Serial1.println("[STOP] DURDURULDU"); break;
+                  }
+              }
+          } 
+          // PAKET TİPİ: SUT VERİSİ (36 Byte)
+          else if (beklenen_boyut == SITSUT_DATA_BOYUT) {
+              if (ttl_buf[34] == SITSUT_FOOTER1 && ttl_buf[35] == SITSUT_FOOTER2) {
+                  // Checksum doğrula (8 float = 32 byte)
+                  uint8_t chk_hesap = 0;
+                  for (int i = 1; i <= 32; i++) chk_hesap += ttl_buf[i];
+                  
+                  if (chk_hesap == ttl_buf[33]) {
+                      // Verileri global değişkenlere dağıt
+                      SitPaketi* sut_data = (SitPaketi*)ttl_buf;
+                      irtifa = sut_data->irtifa;
+                      basinc = sut_data->basinc;
+                      ivmeX  = sut_data->ivmeX;
+                      ivmeY  = sut_data->ivmeY;
+                      ivmeZ  = sut_data->ivmeZ;
+                      roll   = sut_data->aciX;
+                      pitch  = sut_data->aciY;
+                      yaw    = sut_data->aciZ;
+                  }
+              }
+          }
+          ttl_idx = 0;
+        }
+      }
+    }
+
+    // ─── 2. MOD İŞLEMLERİ ─────────────────────────────────────────────
+    switch (sitSutMod) {
+      case MOD_SIT:
+        // SİT işlemleri Core 0'da (Task1) yürütülüyor.
+        break;
+
+      case MOD_SUT:
+        // SUT işlemleri (veri dağıtımı) yukarıdaki parser içinde yapıldı.
+        break;
+
+      case MOD_BEKLEME:
+      default:
+        break;
+    }
+
+    // ─── 3. TELEMETRİ AKTARIMI (LoRa + SD) — Her modda aktif ──────────
+    // Not: portMAX_DELAY yerine 10ms timeout → TTL sürekli okunabilsin
+    if (xQueueReceive(telemetryQueue, &incomingPacket, pdMS_TO_TICKS(10)) == pdTRUE) {
+
+        // 3a. SD Kart — Veriyi karta logla (~100 Hz)
         if (sdOk && logFile) {
             gonder_paket_csv(logFile, incomingPacket);
-            
-            // Güvenlik: Her 50 pakette bir (yaklaşık 0.5sn) dosyayı fiziksel olarak kaydet
+
             static int flush_sayac = 0;
             if (++flush_sayac >= 50) {
                 logFile.flush();
@@ -553,20 +679,21 @@ void Task2code(void *pvParameters) {
             }
         }
 
-        // 2. LoRa (E32-433T30D) — Her LORA_GONDERIM_ORANI pakettte bir gönder (~10 Hz)
+        // 3b. LoRa — Her LORA_GONDERIM_ORANI pakette bir gönder (~10 Hz)
         lora_sayac++;
         if (lora_sayac >= LORA_GONDERIM_ORANI) {
             gonder_paket_framed(Serial1, incomingPacket);
             lora_sayac = 0;
         }
     }
-    // portMAX_DELAY ile Queue'da beklediğimiz için vTaskDelay gerekmez.
-    // CPU xQueueReceive içinde güvenle uyur, Watchdog tetiklenmez.
+    // 10ms timeout sayesinde TTL komutları sürekli kontrol edilir,
+    // aynı zamanda Queue boşken CPU Watchdog tetiklenmez.
   }
 }
 
 void setup() {
-    // 1. TTL kullanılmıyor — Serial başlatılmadı, pinler boşta
+    // 1. TTL — SİT/SUT komut alma için Serial (UART0) başlatılıyor
+    Serial.begin(BAUD_TTL);
 
     // 2. Pin Modları ve Güvenlik (Tasklardan ÖNCE yapılmalı)
     pinMode(PIN_FUNYE_1, OUTPUT);
