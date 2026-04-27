@@ -1,85 +1,94 @@
-# Trakya Roket 2026 - SİT/SUT Sistem Dokümantasyonu
+# 🚀 Trakya Roket 2026 - SİT/SUT Teknik El Kitabı
 
-Bu doküman, uçuş yazılımı içerisinde yer alan **Sensör İzleme Testi (SİT)** ve **Sentetik Uçuş Testi (SUT)** sistemlerinin teknik detaylarını, haberleşme protokollerini ve kullanım yönergelerini içerir.
-
----
-
-## 1. Sisteme Genel Bakış
-
-SİT/SUT sistemi, roketin donanım ve yazılım bütünlüğünü uçuş öncesinde doğrulamak için geliştirilmiştir. Sistem **çift çekirdek (Dual Core)** mimarisi üzerinde asenkron olarak çalışır.
-
-- **SİT (Sensör İzleme Testi):** Gerçek zamanlı sensör verilerinin (BNO055, BME280) TTL üzerinden yer istasyonuna binary formatta aktarılmasıdır.
-- **SUT (Sentetik Uçuş Testi):** Donanımsal sensörlerin devre dışı bırakılıp, algoritmanın dışarıdan gelen simülasyon verileriyle beslenmesidir.
+Bu doküman, uçuş yazılımı içerisinde yer alan **Sensör İzleme Testi (SİT)** ve **Sentetik Uçuş Testi (SUT)** sistemlerinin çalışma prensiplerini, veri yapılarını ve operasyonel süreçlerini detaylandırmak için hazırlanmıştır.
 
 ---
 
-## 2. Haberleşme Protokolü
+## 1. Giriş: SİT ve SUT Nedir?
 
-Tüm iletişim **TTL (UART0)** portu üzerinden **9600 Baud** hızında gerçekleşir. Paketler binary (ham byte) formatındadır.
+Roket sistemlerinde uçuş öncesi testler kritik öneme sahiptir. Bu sistem, roketi fiziksel olarak fırlatmadan tüm elektronik ve yazılımsal süreçleri simüle etmemize olanak tanır.
 
-### 2.1. Komut Paketleri (PC -> ROKET)
-Komutlar her zaman **5 Byte** uzunluğundadır.
+*   **SİT (Sensör İzleme Testi):** "Roket şu an ne görüyor?" sorusunun cevabıdır. Sensörlerden gelen ham verileri filtrelemeden veya işlemeden olduğu gibi izlememizi sağlar.
+*   **SUT (Sentetik Uçuş Testi):** "Roket bu veriyi alsa ne yapardı?" sorusunun cevabıdır. Uçuş algoritmasını, dışarıdan (PC) gönderilen yapay verilerle besleyerek apogee tespiti ve paraşüt açma gibi kritik kararları test etmemizi sağlar.
 
-| Byte | Tanım | Değer |
+---
+
+## 2. Mimari Yapı ve Veri Akışı
+
+Sistem, ESP32'nin **çift çekirdekli (Dual-Core)** yapısını kullanarak uçuş güvenliğini tehlikeye atmadan çalışır.
+
+### 🧠 Çekirdek Görev Dağılımı
+| Çekirdek | Görev Adı | Sorumluluk |
 | :--- | :--- | :--- |
-| 1 | Header | `0xAA` |
-| 2 | Komut | `0x20` (SİT), `0x22` (SUT), `0x24` (STOP) |
-| 3 | Checksum | `CMD + 0x6C` |
-| 4 | Footer 1 | `0x0D` (\r) |
-| 5 | Footer 2 | `0x0A` (\n) |
+| **Core 0** | `UcusGörevi` | Sensör okuma, SUT verilerini algoritmaya besleme, Fünye kontrolü. |
+| **Core 1** | `HaberlesmeGörevi` | TTL hattını dinleme, Komutları parse etme, LoRa/SD loglama. |
 
-### 2.2. Veri Paketleri (ROKET <-> PC)
-SİT gönderimi ve SUT veri alımı için kullanılan paket **36 Byte** uzunluğundadır.
-
-| Bölüm | Boyut | Tanım |
-| :--- | :--- | :--- |
-| Header | 1 Byte | `0xAB` |
-| Payload | 32 Byte | 8 adet `float32` (İrtifa, Basınç, İvmeX/Y/Z, AçıX/Y/Z) |
-| Checksum | 1 Byte | Payload byte'larının toplamı (8-bit sum) |
-| Footer | 2 Byte | `0x0D`, `0x0A` |
+### 🔄 Veri Akış Şeması
+1.  **Komut Alımı:** Core 1, TTL (UART0) üzerinden gelen 5 byte'lık komutu yakalar.
+2.  **Mod Değişimi:** Komut geçerliyse küresel `sitSutMod` değişkeni güncellenir.
+3.  **Algoritma Tetikleme:** Core 0, bu değişkeni kontrol ederek ya sensörleri okur ya da TTL'den gelen veriyi bekler.
+4.  **Geri Bildirim:** Core 0 veriyi işler, Core 1 ise sonucu LoRa ve SD karta yazar.
 
 ---
 
-## 3. Çalışma Modları
+## 3. Haberleşme Protokolü Detayları
 
-### 3.1. SİT Modu İşleyişi
-1. Yer istasyonundan `0x20` komutu gönderilir.
-2. `sitSutMod` değişkeni `MOD_SIT` olur.
-3. Core 0 (Task1), her döngüde güncel sensör verilerini `0xAB` header'ı ile TTL'den basmaya başlar.
+Tüm iletişim **UART0 (TTL)** üzerinden **9600 Baud** hızında, binary formatta yapılır.
 
-### 3.2. SUT Modu İşleyişi
-1. Yer istasyonundan `0x22` komutu gönderilir.
-2. Core 0, donanımsal sensör okumayı ve Kalman filtrelerini askıya alır.
-3. Yer istasyonu `0xAB` header'ı ile 36 byte'lık veri paketleri göndermeye başlar.
-4. Core 1 (Task2), gelen paketleri parse ederek küresel sensör değişkenlerini günceller.
-5. Uçuş algoritması bu "yapay" verilerle sanki uçuyormuş gibi kararlar üretir.
+### 3.1. Komut Yapısı (5 Byte)
+PC'den rokete gönderilen kontrol paketleridir.
+`[HEADER][COMMAND][CHECKSUM][FOOTER1][FOOTER2]`
+
+- **Header:** `0xAA` (Sabit)
+- **Komutlar:** 
+  - `0x20`: SİT Başlat
+  - `0x22`: SUT Başlat
+  - `0x24`: Testi Durdur (Bekleme Modu)
+- **Checksum:** `CMD + 0x6C` (Taşmalar 8-bit olarak hesaplanır)
+- **Footer:** `0x0D 0x0A` (\r\n)
+
+### 3.2. Veri Paketi Yapısı (36 Byte)
+SİT veri gönderimi ve SUT veri girişi için kullanılan standart pakettir.
+`[0xAB][32 Byte Payload][Checksum][0x0D][0x0A]`
+
+**Payload İçeriği (Her biri 4 Byte - Float):**
+1. İrtifa (m)
+2. Basınç (hPa)
+3. İvme X (m/s²)
+4. İvme Y
+5. İvme Z
+6. Açı X (Roll)
+7. Açı Y (Pitch)
+8. Açı Z (Yaw)
 
 ---
 
-## 4. Test ve Doğrulama
+## 4. Kullanım Rehberi
 
-### 4.1. Python Test Aracı (`sit_sut_test.py`)
-Bilgisayar üzerinden sistemi kontrol etmek için kullanılan scripttir. Şu işlevleri sunar:
-- Manuel komut gönderimi.
-- SİT verilerinin canlı grafiksel/metinsel takibi.
-- Otomatik uçuş senaryosu (simülasyon) koşturma.
+### 🛠️ SİT Modu Nasıl Kullanılır?
+1. Roketi bilgisayara TTL-USB dönüştürücü ile bağlayın.
+2. `sit_sut_test.py` uygulamasını çalıştırın ve portu seçin.
+3. **Seçenek 1**'e basın. Ekranda sensörlerden gelen canlı verileri (İrtifa, Basınç vb.) göreceksiniz.
+4. Sensörleri hareket ettirerek verilerin değiştiğini doğrulayın.
 
-### 4.2. Birim Testleri (`test/test_main.cpp`)
-PlatformIO Unity framework'ü kullanılarak yazılmıştır. `pio test` komutu ile çalıştırılır.
-- Checksum hesaplama doğruluğu.
-- Paket yapısı (struct padding) uyumluluğu.
-- Protokol limit testlerini içerir.
+### 🚀 SUT (Simülasyon) Nasıl Yapılır?
+1. **Seçenek 2** ile SUT modunu aktif edin.
+2. Roket artık gerçek sensörleri okumayı bırakır ve sizden veri bekler.
+3. **Seçenek 4**'e basarak hazır bir "Yükseliş Senaryosu" başlatın.
+4. Roketin LoRa üzerinden gönderdiği telemetriyi izleyerek; irtifa yükseldiğinde algoritmanın "Yükseliyor" durumuna geçip geçmediğini kontrol edin.
 
 ---
 
-## 5. Önemli Notlar ve Güvenlik
+## 5. Güvenlik ve Uyarılar
 
 > [!IMPORTANT]
-> SUT modundayken roketin gerçek GPS verileri güncellenmez; ancak LoRa telemetrisi SUT verileriyle birlikte akmaya devam eder.
+> **Donanım Kilidi:** SUT modundayken algoritma paraşütleri gerçekten ateşleyebilir. Test sırasında fünyelerin takılı olmadığından emin olun veya sadece yazılımsal durumları izleyin.
 
 > [!WARNING]
-> SİT/SUT aktifken fünye çıkışları algoritma tarafından tetiklenebilir. Testler sırasında ateşleyicilerin (e-match) bağlı olmadığından emin olunmalıdır.
+> **Gecikme Payı:** TTL üzerinden veri gönderirken saniyede 20 paketi (20 Hz) geçmemeye özen gösterin. Yüksek hızlar buffer taşmasına neden olabilir.
+
+> [!TIP]
+> Test bittikten sonra mutlaka **Seçenek 3 (Durdur)** ile sistemi bekleme moduna alın. Aksi takdirde roket gerçek sensörleri okumaya geri dönmez.
 
 ---
-*Hazırlayan: Antigravity AI Coding Assistant*
-*Tarih: 27 Nisan 2026*
+*Trakya Roket Takımı 2026 - Yazılım Alt Birimi*
