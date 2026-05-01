@@ -1,4 +1,5 @@
-# 🚀 Trakya Roket 2026 - Uçuş Yazılımı (V2.0)
+# 🚀 Trakya Roket 2026 - Uçuş Kontrol Bilgisayarı (Uçuş Yazılımı V2.0)
+## Mühendislik Tasarım Raporu ve Teknik Dokümantasyon
 
 ![ESP32](https://img.shields.io/badge/Hardware-ESP32--WROOM--32-blue?style=for-the-badge&logo=espressif)
 ![Framework](https://img.shields.io/badge/Framework-Arduino%20/%20PlatformIO-orange?style=for-the-badge&logo=arduino)
@@ -6,195 +7,178 @@
 ![License](https://img.shields.io/badge/License-MIT-green?style=for-the-badge)
 ![Status](https://img.shields.io/badge/Status-Active_Development-brightgreen?style=for-the-badge)
 
-**Trakya Roket Takımı 2026** yarışmaları için sıfırdan tasarlanmış, yüksek performanslı, asenkron ve hata toleranslı görev bilgisayarı (uçuş kontrol) yazılımıdır. 
-
-Yazılımın temel odağı ve kalbi **`main.cpp`** üzerinde koşan uçuş algoritmasıdır. Sistem; ESP32'nin çift çekirdek mimarisini, FreeRTOS kuyruk yapısını, DMA (Direct Memory Access) destekli donanım haberleşmesini ve 1D Gelişmiş Kalman filtrelerini bir araya getirerek uçuş güvenliğini en üst seviyeye çıkarmayı hedefler. SİT/SUT simülasyonları ise bu ana yapıya entegre çalışan ikincil eklenti modülleridir.
+Bu doküman, **Trakya Roket Takımı 2026** yarışma isterleri (Teknofest / IREC) doğrultusunda sıfırdan tasarlanmış olan asenkron, hata toleranslı ve deterministik görev bilgisayarı yazılımının detaylı sistem mimarisini, algoritmik temellerini ve acil durum protokollerini açıklamaktadır.
 
 ---
 
 ## 📋 İçindekiler
-1. [Sistem Mimarisi & Veri Akışı](#-sistem-mimarisi--veri-akışı)
-2. [Çift Çekirdek İşleme Modeli](#-çift-çekirdek-dual-core-işleme-modeli)
-3. [Donanım Altyapısı ve Pinout](#-donanım-altyapısı-ve-pin-bağlantıları)
-4. [Gelişmiş Uçuş Algoritmaları](#-gelişmiş-uçuş-algoritmaları)
-   - [Uçuş Durum Makinesi (State Machine)](#uçuş-durum-makinesi-state-machine)
-   - [Tepe Noktası (Apogee) Tespiti ve Güvenlik Kapısı](#tepe-noktası-apogee-tespiti-ve-güvenlik-kapısı)
-5. [Haberleşme & Loglama Protokolü](#-haberleşme-ve-loglama-protokolü)
-6. [Eklenti Modüller: SİT & SUT Testleri](#-eklenti-modüller-si̇t--sut-testleri)
-7. [Proje Yapısı](#-proje-yapısı)
-8. [Kurulum, Derleme ve Kullanım](#-kurulum-derleme-ve-kullanım)
+1. [Özet (Abstract) ve Tasarım Felsefesi](#1-özet-abstract-ve-tasarım-felsefesi)
+2. [Sistem Mimarisi: Çift Çekirdek ve FreeRTOS](#2-sistem-mimarisi-çift-çekirdek-ve-freertos)
+3. [Algoritmik Altyapı ve Matematiksel Modeller](#3-algoritmik-altyapı-ve-matematiksel-modeller)
+   - [Sensör Füzyonu ve 1D Kalman Filtreleri](#sensör-füzyonu-ve-1d-kalman-filtreleri)
+   - [Anlık Dikey Hız (Vz) ve Eğim Açısı Hesabı](#anlık-dikey-hız-vz-ve-eğim-açısı-hesabı)
+   - [Apogee Tespiti ve Durum Makinesi (State Machine)](#apogee-tespiti-ve-durum-makinesi-state-machine)
+4. [Haberleşme ve Veri İşleme Protokolleri](#4-haberleşme-ve-veri-i̇şleme-protokolleri)
+   - [LoRa Telemetri Paketi (Packed Struct & CRC)](#lora-telemetri-paketi-packed-struct--crc)
+   - [SD Kart Ping-Pong Buffer (DMA Loglama)](#sd-kart-ping-pong-buffer-dma-loglama)
+5. [Hata Modları ve Etki Analizi (FMEA)](#5-hata-modları-ve-etki-analizi-fmea)
+6. [Donanım Altyapısı ve Pinout (Wiring Haritası)](#6-donanım-altyapısı-ve-pinout-wiring-haritası)
+7. [Kurulum, Entegrasyon (SİT/SUT) ve Çalıştırma](#7-kurulum-entegrasyon-si̇tsut-ve-çalıştırma)
 
 ---
 
-## 🏗️ Sistem Mimarisi & Veri Akışı
+## 1. Özet (Abstract) ve Tasarım Felsefesi
 
-Yazılımımız tek bir döngüde her şeyi yapmak yerine, kritik işleri donanım seviyesinde asenkron olarak gerçekleştirir. Sensör okumaları, filtrelemeler ve durum kararları birinci çekirdekte saniyede 100 defa güncellenirken, veri aktarımı ve kayıt işlemleri diğer çekirdeğe bırakılır.
+Uçuş kontrol sistemleri (Avionics), roketin aerodinamik kuvvetler altında doğru kararları saliseler içinde alabilmesini gerektirir. Önceki nesil yazılımlarda karşılaşılan "SD kart yazma gecikmesi yüzünden sensör okumanın durması" (Blocking loop) problemini aşmak için, V2.0 yazılımı **tamamen asenkron (Non-Blocking)** bir yapıya geçirilmiştir. 
+
+Yazılımın kalbi `main.cpp` üzerinde koşmakta olup, temel odağı roketin apogee (tepe) noktasını mutlak güvenlikle tespit etmek, yanlış ayrılmaları önlemek ve uçuş verilerini %0 kayıpla yer istasyonuna iletmektir.
+
+---
+
+## 2. Sistem Mimarisi: Çift Çekirdek ve FreeRTOS
+
+Geleneksel `loop()` döngüsü terkedilerek FreeRTOS (Real-Time Operating System) altyapısı kurulmuştur. ESP32'nin işlem gücü, görevlerin (Task) kritiklik derecelerine göre paylaştırılmıştır.
 
 ```mermaid
 graph TD
-    subgraph "Core 0 (Uçuş Görevi - ~100 Hz)"
-        S1[BNO055 İvme/Gyro/Euler] --> |I2C| K1[Kalman Filtresi]
-        S2[BME280 Basınç/İrtifa] --> |I2C| K1
-        S3[GY-NEO-7M GPS] --> |UART2| K1
-        
-        K1 --> CALC[Anlık Dikey Hız & Eğim Açısı Hesabı]
-        CALC --> SM[State Machine & Apogee Kontrol]
-        SM --> |400ms Non-Blocking Sinyal| R[Kurtarma: Fünye 1 & 2]
-        SM --> P[TelemetryPacket Struct Oluşturma]
+    subgraph "Core 0: Uçuş ve Kontrol (Öncelik: 2, Hız: ~100 Hz)"
+        S1[BNO055] & S2[BME280] & S3[GPS] --> KF[13x Kalman Filtresi]
+        KF --> CALC[Türev & Trigonometri Motoru]
+        CALC --> SM[State Machine]
+        SM --> |Ateşleme Sinyali| F1[Fünye Mosfetleri]
+        SM --> PKT[TelemetryPacket Oluşturma]
     end
 
-    subgraph "Core 1 (Haberleşme & Loglama)"
-        Q --> |xQueueReceive| D{Veri Dağıtıcı}
-        D --> |Ping-Pong Tampon ~100 Hz| SD[(SD Kart - CSV Loglama)]
-        D --> |DMA UART ~10 Hz| LR[E32-433T30D LoRa]
+    subgraph "Core 1: Haberleşme ve I/O (Öncelik: 1, Hız: CPU Boşken)"
+        Q --> |xQueueReceive| DISPATCH{Veri Dağıtıcı}
+        DISPATCH --> |512 Byte Block| SD[SD Kart CSV Log]
+        DISPATCH --> |Her 10 Pakette Bir| LORA[LoRa DMA UART]
     end
 
-    P -->|xQueueSend| Q[(FreeRTOS Queue - 10 Kapasite)]
+    PKT -->|xQueueSend| Q[(FreeRTOS Queue - 10 Kapasite)]
 ```
 
-### 🧠 Çift Çekirdek (Dual-Core) İşleme Modeli
-
-Uçuş kontrol bilgisayarımız, FreeRTOS kullanarak ESP32'nin iki çekirdeğini görev bazlı ayırır:
-
-*   **CORE 0 (Uçuş Görevi / Kritik Döngü):** Sadece roketin fiziki durumuna odaklanır. İrtifa, ivme ve Euler açılarını okur, bu verileri 13 farklı 1D Kalman filtresinden geçirir, anlık dikey hızı hesaplar ve **Uçuş Durum Makinesi**'ni (State Machine) işletir. Karar verilen anlarda (Apogee veya 550m) fünyelere enerji gönderir. Tüm güncel verileri paketleyip `xQueueSend` ile kuyruğa bırakır. Döngü hızı yaklaşık **100 Hz**'dir.
-*   **CORE 1 (Haberleşme & Loglama / Yavaş İşler):** Uçuş hesaplamalarını kilitleme (blocking) riskini ortadan kaldırmak için çevresel iletişimler bu çekirdekte yapılır. FreeRTOS kuyruğundan paketi okur. SD karta 512-byte'lık **Ping-Pong tamponlama** mantığıyla veriyi yazar ve her 10. paketi (frekansı yaklaşık 10 Hz'e düşürerek) DMA (Direct Memory Access) üzerinden ring buffer aracılığıyla LoRa modülüne aktarır.
+### Görev Dağılımı ve Önceliklendirme
+1.  **Task1 (Core 0 - Priority 2):** Sistemin en yüksek öncelikli döngüsüdür. Sensörlerden I2C üzerinden veri çeker, filtreler ve uçuş algoritmasını koşturur. Ürettiği paketi `xQueueSend` ile kuyruğa atar. Kuyruk doluysa (Core 1 yetişemiyorsa) sistem beklemez, eski veriyi ezer (veya atlar), böylece **uçuş hesaplamaları asla gecikmez**.
+2.  **Task2 (Core 1 - Priority 1):** Sadece `xQueueReceive` fonksiyonunda bekler (CPU'yu %0 kullanır). Veri geldiğinde uyanır, SD kartın Ping-Pong tamponlarına kopyalar ve zamanı gelmişse UART1 ring-buffer'ına basar.
 
 ---
 
-## 🛰️ Donanım Altyapısı ve Pin Bağlantıları
+## 3. Algoritmik Altyapı ve Matematiksel Modeller
 
-Görev bilgisayarı, yüksek hassasiyetli uçuş kontrolü için endüstri standardı modüller kullanmaktadır:
+### Sensör Füzyonu ve 1D Kalman Filtreleri
+Donanımsal gürültüleri (örneğin motor titreşimi yüzünden barometredeki basınç dalgalanmaları) filtrelemek için, her bir ölçüm ekseni için 1 Boyutlu (1D) `SimpleKalmanFilter` nesneleri oluşturulmuştur.
 
-*   **İvmeölçer & Jiroskop (BNO055):** Donanımsal Sensör Füzyonu barındırır. CPU'ya yük bindirmeden Roll, Pitch, Yaw açılarını doğrudan hesaplanmış olarak sunar. Eğim (Tilt) hesaplamasının temelidir.
-*   **Barometre (BME280):** Basınç, sıcaklık ve nem ölçer. Basınç üzerinden milimetrik hassasiyette irtifa hesaplanır ve zamana göre türevi alınarak **Anlık Dikey Hız (Vz)** tespit edilir.
-*   **GPS (GY-NEO-7M):** Uçuş sonrası kurtarma ekipleri için roketin global koordinatlarını sağlar.
-*   **Telemetri (E32-433T30D LoRa):** 9600 baud hızında, UART üzerinden asenkron veri yollar.
-*   **Kara Kutu (SD Kart - SPI):** Verileri yüksek frekansta CSV (`ucus_log.csv`) formatında loglar.
+*   **BNO055 (İvme/Gyro/Euler):** Hızlı tepki vermesi için ölçüm/tahmin hatası `0.1`, süreç gürültüsü `0.01` olarak ayarlanmıştır.
+*   **BME280 (İrtifa/Basınç):** Yüksek statik gürültü sebebiyle ölçüm hatası `1.5`, süreç gürültüsü `0.1` olarak ayarlanmıştır. Bu sayede irtifa verisi çok daha pürüzsüz (smooth) bir eğri çizer.
 
-### 🔌 ESP32 Pin Haritası (Pinout)
+### Anlık Dikey Hız (Vz) ve Eğim Açısı Hesabı
+Apogee kararı verilebilmesi için roketin hız vektörü ve yer düzlemine göre açısı hesaplanmalıdır.
 
-Sistemin kararlı çalışması için aşağıdaki konfigürasyon kesin olarak uygulanmalıdır:
+**1. Dikey Hız (Vz) Türevi:**
+$$V_z = \frac{\Delta \text{İrtifa}}{\Delta t} = \frac{\text{İrtifa}_{\text{güncel}} - \text{İrtifa}_{\text{önceki}}}{\frac{\text{micros}_{\text{güncel}} - \text{micros}_{\text{önceki}}}{1,000,000}}$$
 
-| Modül / Birim | Pin İşlevi | ESP32 Pin Numarası | Açıklama |
+*Sistem bu hesabı her ~10ms'de bir yaparak anlık düşüş eğilimini algılar.*
+
+**2. Eğim (Tilt) Açısı Trigonometrisi:**
+Roket BNO055 sensöründen Roll ($r$) ve Pitch ($p$) açılarını alır. Roketin Z ekseninin (burnunun) gerçek dikey ile yaptığı açı ($\theta$) şu şekilde bulunur:
+$$\theta = \arccos(\cos(p) \times \cos(r)) \times \frac{180}{\pi}$$
+*(Kalman filtresi gürültüleri sebebiyle $\cos(p) \times \cos(r)$ çarpımı 1.0'ı aşarsa kodda `constrain` ile korunarak NaN (Not a Number) hatası önlenmiştir.)*
+
+### Apogee Tespiti ve Durum Makinesi (State Machine)
+Durum makinesi 5 fazdan oluşur: `HAZIR`, `YUKSELIYOR`, `INIS_1`, `INIS_2`, `INDI`.
+En kritik faz olan `YUKSELIYOR` modundan `INIS_1` (Drogue Ayrılma) moduna geçiş **Üçlü Onay (Cross-Check)** mekanizmasına bağlanmıştır:
+
+1.  **Bağıl İrtifa Onayı:** $\text{İrtifa}_{\text{güncel}} < (\text{İrtifa}_{\text{maksimum}} - 15 \text{m})$
+2.  **Kinetik Onay:** $V_z < 0$ (Hız vektörü yön değiştirdi)
+3.  **Güvenlik (Tumbling) Onayı:** $\theta < 10^\circ$ (Eğim toleransı)
+
+**Neden Güvenlik Onayı Gerekli?** 
+Roket motor arızasıyla yatay uçuşa geçerse veya takla atmaya başlarsa, burundaki statik deliklerde oluşan rüzgar (dinamik basınç) etkileri BME280 barometresini yanıltarak "sahte bir irtifa düşüşü" algılatabilir. BNO055'ten alınan eğim açısı $<10^\circ$ şartı, roket yatayken veya takla atarken fünye ateşlemesini **kesin olarak engeller**.
+
+---
+
+## 4. Haberleşme ve Veri İşleme Protokolleri
+
+### LoRa Telemetri Paketi (Packed Struct & CRC)
+Veri paketimiz (Payload), bant genişliğini maksimize etmek için `#pragma pack(push, 1)` ile C++ seviyesinde byte boşluksuz olarak sıkıştırılmıştır. Değişken dizilimi:
+
+| Veri Tipi | Boyut | İçerik |
+| :--- | :--- | :--- |
+| `float` (x3) | 12 Byte | ivmeX, ivmeY, ivmeZ |
+| `float` (x3) | 12 Byte | gyroX, gyroY, gyroZ |
+| `float` (x3) | 12 Byte | roll, pitch, yaw |
+| `float` (x3) | 12 Byte | irtifa, dikeyHiz, eglimAcisi |
+| `float` (x2) | 8 Byte | gpsEnlem, gpsBoylam |
+| `bool` (x2) | 2 Byte | ayrilma1_durum, ayrilma2_durum |
+| `uint8_t` | 1 Byte | ucus_durumu (0-4 arası State) |
+| **Toplam Payload** | **59 Byte** | *Bellekte kapladığı alan* |
+
+Yer istasyonuna gönderilen tam çerçeve (Frame) formatı ise şu şekildedir:
+`[0xAA] [0x55] [LEN: 59] [ ...59 Byte Struct... ] [CRC16_HI] [CRC16_LO]` (Toplam 64 Byte). 
+
+UART1 hattında yaşanabilecek elektriksel gürültüler veya ring-buffer kaymaları `CRC16-CCITT` algoritmasıyla tespit edilir. Yer istasyonu CRC'si tutmayan paketi (corrupted data) anında reddeder.
+
+### SD Kart Ping-Pong Buffer (DMA Loglama)
+SPI üzerinden SD karta yazma işlemi genelde 5-20ms sürer, ancak kart içi bellek yönetimi (Wear Leveling) devreye girdiğinde bu süre 200ms'ye kadar çıkabilir. Bu durum uçuş kontrolünü dondurur. 
+
+Çözüm olarak **512 Byte'lık A ve B tamponları** oluşturulmuştur:
+1. Gelen CSV satırları A tamponuna dolar.
+2. A tamponu dolduğunda ESP32'nin DMA birimine "Bunu SD karta yaz" emri verilir.
+3. ESP32 CPU'su beklemeden (Non-Blocking) yeni verileri anında B tamponuna yazmaya devam eder.
+
+---
+
+## 5. Hata Modları ve Etki Analizi (FMEA)
+
+Sistem uçuş sırasında oluşabilecek donanımsal ve yazılımsal arızalara karşı korunmalıdır:
+
+| Arıza Modu | Sistemin Tepkisi (Mitigation) |
+| :--- | :--- |
+| **BME280 Bozulması / Bağlantı Kopması** | I2C veri yolu hata fırlatır ancak Kalman filtreleri son mantıklı veriyi tutar. (Sistemin 3 bağımsız veriye ihtiyacı olduğu için kurtarma riske girer. Redundancy (Çift sensör) ileriki versiyonlarda eklenecektir.) |
+| **BNO055 Kalibrasyon Kaybı** | `setup()` fonksiyonunda sistem "Kalibrasyon Puanı > 1" olmadan uçuş döngüsüne geçişi kilitler. Uçuşta bozulursa Kalman filtresi yumuşatır, ancak Tilt (Güvenlik Kapısı) hesaplamaları sapabilir. |
+| **SD Kartın Takılmaması / Çıkması** | `SD.begin()` başarısız olursa `sdOk = false` bayrağı çekilir. Sistem loglama fonksiyonlarını atlar (Bypass) ancak uçuş döngüsü ve LoRa aktarımı kayıpsız devam eder. |
+| **Fünye Mosfetinin Açık Kalması** | `Funye1Atesle()` fonksiyonu `delay()` kullanmaz. Zaman damgası (`millis()`) alır. Döngü içerisindeki `funye_guncelle()` fonksiyonu tam 400ms sonra (veya döngü ilk uğradığında) elektriği donanımsal seviyede keser. |
+| **FreeRTOS Kuyruk Şişmesi** | Core 1 (Haberleşme) kilitlenirse veya LoRa gecikirse, Core 0 (Uçuş) `xQueueSend(..., 0)` kullandığı için beklemeyi reddeder ve o anki paketi silip yoluna devam eder. |
+
+---
+
+## 6. Donanım Altyapısı ve Pinout (Wiring Haritası)
+
+*Not: Kullanılmayan eski TTL (RX:1, TX:3) bağlantıları yazılımdan temizlenmiş olup, DMA yetenekli pinlere göç edilmiştir.*
+
+| Donanım Birimi | Pin Sinyali | ESP32 Pin Numarası | Özel Ayarlar |
 | :--- | :--- | :---: | :--- |
-| **I2C Hattı** | SDA / SCL | `21` / `22` | BNO055 ve BME280 ortak veri hattı |
-| **SPI Hattı** | MISO/MOSI/SCK | `19` / `23` / `18` | SD Kart Modülü iletişimi |
-| **SD Kart** | CS (Chip Select)| `5` | SD Kart seçimi |
-| **GPS** | RX / TX (UART2)| `16` / `17` | GY-NEO-7M haberleşmesi |
-| **LoRa (Telemetri)**| RX / TX (UART1)| `33` / `32` | E32-433T30D modülü |
-| **Kurtarma (Fünye)** | Fünye 1 / Fünye 2| `27` / `14` | Ayrılma sistemlerini tetikler (Mosfet Sinyali) |
-| **Göstergeler** | Buzzer / LED'ler| `12` / `13, 25, 26`| Uçuş durumu ve hata uyarı donanımları |
-
-*(Not: Eski TTL haberleşme pinleri (1 ve 3) koddan çıkartılmış olup, UART1 ve UART2 kullanılmaktadır.)*
+| **I2C Veriyolu** | SDA / SCL | `21` / `22` | BNO055 (`0x28`), BME280 (`0x76` / `0x77`) |
+| **SPI Veriyolu (SD)** | SCK / MISO / MOSI | `18` / `19` / `23` | SPI hız limitleri donanımsal uygulanır |
+| **SD Kart** | CS / DET (Algılama) | `5` / `35` | CS aktiftir, DET input pull-up'tır |
+| **GPS (GY-NEO-7M)** | RX2 / TX2 | `16` / `17` | `9600 Baud`, UART2 modülü |
+| **LoRa (E32)** | RX1 / TX1 | `33` / `32` | `9600 Baud`, UART1 Modülü (DMA Ring-Buffer 2048B) |
+| **Mosfet (Fünyeler)**| Fünye 1 / Fünye 2| `27` / `14` | Normalde LOW, 400ms HIGH sinyali (3.3V gate) |
+| **Uyarı Birimleri** | Buzzer / LED 1,2,3 | `12` / `26, 4, 25`| Uçuş fazı ve hata sinyalizasyonu |
 
 ---
 
-## 🧮 Gelişmiş Uçuş Algoritmaları
+## 7. Kurulum, Entegrasyon (SİT/SUT) ve Çalıştırma
 
-### Uçuş Durum Makinesi (State Machine)
-Roket kalkıştan inişe kadar anlık değerlerine göre 5 ana durumdan (State) birinde bulunur:
+### Kurulum Adımları
+Sistem, Arduino IDE'nin eski ve senkron kütüphane yapısı yerine **PlatformIO** profesyonel derleme ortamı kullanılarak tasarlanmıştır.
 
-1.  **`HAZIR` (0):** Rampa üzerinde. Sensör kalibrasyonları tamamlanmış ve `referans_basinc` alınmıştır. Z ekseninde `20 m/s²` üstü ivme aranır.
-2.  **`YUKSELIYOR` (1):** Kalkış tespit edildi. Motor yanıyor ve roket tırmanışta. Maksimum irtifa sürekli güncellenir. Apogee şartları gözetlenir.
-3.  **`INIS_1` (2):** Apogee'de birinci (Drogue) paraşüt ateşlendi. Roket serbest düşüş / kontrollü sürüklenme evresinde.
-4.  **`INIS_2` (3):** Roket belirlenen güvenli irtifaya (`550m`) indiğinde Ana (Main) paraşüt ateşlendi.
-5.  **`INDI` (4):** Dikey hız sıfırlandı ve irtifa 20 metrenin altında. Sistem veri aktarımına devam eder ancak kurtarma mekanizmaları tamamen kilitlenir.
-
-### Tepe Noktası (Apogee) Tespiti ve Güvenlik Kapısı
-Erken veya yanlış ateşlemeyi (Premature Ejection) kesinlikle önlemek için 3 aşamalı çapraz sensör kontrolü (Cross-Check) yapılır.
-
-**Kriterler:**
-1.  **İrtifa Düşüşü (BME280):** Güncel irtifa, o ana kadar kaydedilmiş maksimum irtifadan en az `15 metre` aşağıda olmalıdır.
-2.  **Dikey Hız (BME280):** Anlık dikey hız negatif (`Vz < 0`) olmalıdır (Roket artık düşmektedir).
-3.  **Güvenlik Kapısı (BNO055 Tilt Control):** Roketin dikeyden sapma (eğim) açısı `10°` tolerans sınırları içinde olmalıdır. **Roket yatay seyrediyorsa veya takla atıyorsa (Tumbling), basınç anormalliklerinden dolayı paraşüt açılması engellenir.**
-
-Tüm şartlar karşılandığında, `Funye1Atesle()` fonksiyonu ile 400ms boyunca mosfetler tetiklenir (Non-Blocking bekleme ile sistem kilitlenmez).
-
-```mermaid
-flowchart TD
-    A([Uçuş Fazı: YUKSELIYOR]) --> B[Sensör Verilerini Oku]
-    B --> C{İrtifa, Max İrtifadan 15m düşük mü?}
-    C -- Hayır --> B
-    C -- Evet --> D{Anlık Dikey Hız Negatif mi? Vz < 0}
-    D -- Hayır --> B
-    D -- Evet --> E{Eğim Açıları Tolerans Sınırında mı? < 10°}
-    E -- Hayır --> F[Ateşleme İptal! Roket takla atıyor / Yatay]
-    F --> B
-    E -- Evet --> G([APOGEE TESPİT EDİLDİ])
-    G --> H[Fünye 1 Ateşle - 400ms]
-    H --> I([Yeni Faz: INIS_1])
-```
-
-### Anlık Dikey Hız (Vz) Hesaplaması
-Barometreden alınan irtifanın mikro-saniye cinsinden zamana göre türevi alınır. Delta zaman hesaba katılarak anlık düşüş veya yükseliş hızı bulunur. Ani basınç dalgalanmalarının türevi bozmaması için bu veri de öncesinde Kalman filtresinden süzülmüş irtifa üzerinden hesaplanır.
-
----
-
-## 🔄 Haberleşme ve Loglama Protokolü
-
-### Çerçeveli Binary Veri Aktarımı (LoRa)
-Paket formatı özel olarak veri kaybını, bit kaymalarını ve eksik iletimleri önleyecek sıkıştırılmış (Packed Struct) yapıda tasarlanmıştır.
-
-`[0xAA] [0x55] [LEN: 71 Byte] [ TELEMETRİ VERİSİ ] [CRC16_HI] [CRC16_LO]`
-
-*   **`#pragma pack(1)`:** Telemetri struct'ı bellekte boşluksuz dizilir, bu sayede RAM'den doğrudan `uart_write_bytes` ile DMA üzerinden yollanır. Bant genişliğinden maksimum tasarruf edilir.
-*   **CRC16-CCITT Uygulama Katmanı:** LoRa modülleri kendi içinde RF CRC yapsa bile, UART hattındaki elektriksel gürültüler yüzünden kaybolan byte'lar veya eksik okumalar Yer İstasyonunda paketlerin çöpe dönmesine yol açar. Paket sonundaki 16-bit CRC ile yer istasyonu yazılımımız gelen her paketin bütünlüğünü matematiksel olarak doğrular.
-
-### Ping-Pong SD Kart Tamponu (Loglama)
-SD karta veriler CSV formatında satır satır yazılır: `ivmeX, ivmeY, ..., gpsEnlem, state`
-Ancak SD kart yazma işlemi anlık gecikmeler (Latency/Blocking) yaratabilir. Bunu önlemek için **512 Byte'lık A ve B Buffer'ları (Ping-Pong)** kullanılır. Veriler `A` tamponuna dolar, dolduğunda DMA ile SD karta basma emri verilirken sistem duraksamaz ve veriler anında `B` tamponuna yazılmaya devam eder. Her 100 paket döngüsünde (1 saniye) bir `flush()` ile SD karta fiziksel kalıcı kayıt atılır.
-
----
-
-## 🔌 Eklenti Modüller: SİT & SUT Testleri
-
-Yazılımın ana mimarisi olan gerçek uçuş senaryosunun (`main.cpp`) yanında, yarışma kurullarının zorunlu tuttuğu entegrasyon testleri için bağımsız eklenti modülleri tasarlanmıştır.
-
-*   **SİT (Sistem Entegrasyon Testi):** Sensör verilerinin (özellikle BNO055 ve BME280) ve ayrılma (fünye) mantıklarının yer istasyonundan canlı olarak izlenmesi.
-*   **SUT (Sentetik Uçuş Testi):** Uçuş algoritmasının sanal simülasyonudur. Yer istasyonu üzerinden roket anakartına sanki uçuyormuş gibi yapay irtifa ve ivme verisi basılarak durum makinesi tetiklenir (Örneğin, roket masadayken sahte irtifa verisi 3000m yapılıp düşürülerek Apogee testi icra edilir).
-
-*(Not: SİT/SUT detaylı yönergeleri `SİT_SUT/sit-sut-dokümantasyon.md` dosyasında yer almaktadır.)*
-
----
-
-## 📂 Proje Yapısı
-
-```bash
-├── src/
-│   ├── main.cpp                 # Ana uçuş yazılımı (Dual-Core, FreeRTOS, Kalman, State Machine)
-│   └── SİT_SUT/
-│       └── SİT-SUT.cpp          # Zorunlu test senaryosu kodları
-├── include/                     # Projeye özel başlık dosyaları
-├── lib/                         # İhtiyaç duyulursa yerel kütüphaneler
-├── SİT_SUT/                     
-│   ├── sit_sut_test.py          # SUT veri simülasyonu için Python scripti
-│   └── sit-sut-dokümantasyon.md # Kurul sunumları ve test yönergeleri
-├── test/
-│   └── test_ucus/               # PlatformIO C++ Unit test modülleri
-├── platformio.ini               # Derleme, kütüphane bağımlılıkları ve kart (ESP32) ayarları
-└── README.md                    # Proje teknik dokümantasyonu
-```
-
----
-
-## 🚀 Kurulum, Derleme ve Kullanım
-
-Sistem doğrudan **PlatformIO** ekosistemi üzerine kuruludur. Arduino IDE kullanılması önerilmez.
-
-### Gerekli Adımlar:
 1.  Bilgisayarınıza **VS Code** ve **PlatformIO IDE** eklentisini kurun.
-2.  Bu depoyu klonlayın ve PlatformIO üzerinden proje klasörünü `Open Project` diyerek açın.
-3.  `platformio.ini` dosyası sayesinde projenin ihtiyacı olan tüm kütüphaneler (`Adafruit BNO055`, `Adafruit BME280 Library`, `TinyGPSPlus` vb.) arka planda otomatik olarak indirilecektir.
-4.  Donanım pinlerinizi yukarıdaki Pinout tablosuna uygun şekilde ESP32 geliştirme kartınıza bağlayın.
-5.  Arayüzün sol alt kısmındaki **"Build" (✓)** ikonuna tıklayarak derlemeyi kontrol edin.
-6.  ESP32'yi bilgisayarınıza bağlayın ve **"Upload" (➔)** ikonuna tıklayarak uçuş yazılımını yükleyin.
+2.  Depoyu bilgisayarınıza klonlayın ve PlatformIO içerisinden klasörü açın.
+3.  Kütüphaneler (`Adafruit BNO055`, `BME280`, `TinyGPSPlus` vb.) `platformio.ini` üzerinden otomatik olarak indirilecektir.
+4.  "Build" butonu ile C++11 (veya üstü) standartlarında derleyin ve ESP32'ye "Upload" edin.
 
-### ⚠️ Uçuş Öncesi Kontroller (Pre-Flight Checks)
-- ESP32 enerjilendikten sonra BME280 yerel basıncı (referans irtifasını) otomatik olarak ölçecektir. **Sisteme enerji rampa konumunda, hareket ettirilmeden önce verilmelidir.**
-- BNO055 sensörü kalibrasyon kalitesi (System/Gyro/Accel/Mag) yeterli seviyeye gelmeden uçuş durumuna geçmez. Konsoldan kalibrasyon onayı beklenmelidir.
-- SD kartın takılı olduğundan ve "SD Kart Başlatıldı" loğunun alındığından emin olun.
+### SİT/SUT (Sistem / Sentetik Uçuş Testleri)
+Yarışma komitelerinin zorunlu tuttuğu algoritmik yeterlilik testleri için yazılıma uçuş simülatörü kabiliyeti kazandırılmıştır. Gerçek sensör verileri iptal edilip, Python tabanlı bir yer istasyonundan (Bkz: `SİT_SUT/sit_sut_test.py`) UART üzerinden yapay irtifa ve ivme verisi basılarak uçuş evreleri (Örn: 3000m'ye çıkıp düşme senaryosu) sanal olarak icra edilebilir.
+
+### Uçuş Öncesi Zorunlu Kontroller (Pre-Flight Checks)
+- [ ] ESP32 enerjilendikten sonra roket rampa üzerinde **sabit tutulmalıdır**. BME280 yerel basıncı (0 m irtifası) ölçmek için 20 iterasyonluk bir ortam kalibrasyonu yapar.
+- [ ] BNO055 sensörü yer manyetik alanına ve jiroskop sapmalarına karşı kendi kendini kalibre edene kadar sistem "Kalibrasyon Bekleniyor" loğu atar. Kalkış onayı için bu kalibrasyon seviyesinin minimum (1/3) olması şarttır.
+- [ ] Fünye hatlarının dirençleri (Continuity Check) ve pil voltajları mekanik ekip tarafından son kez manuel kontrol edilmelidir.
 
 ---
 
-**Trakya Roket Takımı 2026** - *Gelecek Göklerde!*
+**Trakya Roket Takımı 2026** - *Per aspera ad astra!*
+
 
