@@ -93,9 +93,9 @@ Tilt Açısı = acos( cos(Pitch) * cos(Roll) ) * (180 / PI)
 Durum makinesi 5 fazdan oluşur: `HAZIR`, `YUKSELIYOR`, `INIS_1`, `INIS_2`, `INDI`.
 En kritik faz olan `YUKSELIYOR` modundan `INIS_1` (Drogue Ayrılma) moduna geçiş **Üçlü Onay (Cross-Check)** mekanizmasına bağlanmıştır:
 
-1.  **Bağıl İrtifa Onayı:** $\text{İrtifa}_{\text{güncel}} < (\text{İrtifa}_{\text{maksimum}} - 15 \text{m})$
-2.  **Kinetik Onay:** $V_z < 0$ (Hız vektörü yön değiştirdi)
-3.  **Güvenlik (Tumbling) Onayı:** $\theta < 10^\circ$ (Eğim toleransı)
+1.  **Bağıl İrtifa Onayı:** `Güncel İrtifa < (Maksimum İrtifa - 15m)`
+2.  **Kinetik Onay:** `Vz < 0` (Hız vektörü yön değiştirdi)
+3.  **Güvenlik (Tumbling) Onayı:** `Tilt Açısı < 10 Derece` (Eğim toleransı)
 
 **Neden Güvenlik Onayı Gerekli?** 
 Roket motor arızasıyla yatay uçuşa geçerse veya takla atmaya başlarsa, burundaki statik deliklerde oluşan rüzgar (dinamik basınç) etkileri BME280 barometresini yanıltarak "sahte bir irtifa düşüşü" algılatabilir. BNO055'ten alınan eğim açısı $<10^\circ$ şartı, roket yatayken veya takla atarken fünye ateşlemesini **kesin olarak engeller**.
