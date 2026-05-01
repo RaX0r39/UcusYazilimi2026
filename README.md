@@ -76,14 +76,18 @@ Donanımsal gürültüleri (örneğin motor titreşimi yüzünden barometredeki 
 Apogee kararı verilebilmesi için roketin hız vektörü ve yer düzlemine göre açısı hesaplanmalıdır.
 
 **1. Dikey Hız (Vz) Türevi:**
-$$V_z = \frac{\Delta \text{İrtifa}}{\Delta t} = \frac{\text{İrtifa}_{\text{güncel}} - \text{İrtifa}_{\text{önceki}}}{\frac{\text{micros}_{\text{güncel}} - \text{micros}_{\text{önceki}}}{1,000,000}}$$
+```text
+Vz = (Güncel İrtifa - Önceki İrtifa) / (Geçen Zaman_sn)
+```
 
-*Sistem bu hesabı her ~10ms'de bir yaparak anlık düşüş eğilimini algılar.*
+*Sistem bu hesabı (mikro-saniye hassasiyetinde delta zaman bularak) her ~10ms'de bir yapar ve anlık düşüş eğilimini algılar.*
 
 **2. Eğim (Tilt) Açısı Trigonometrisi:**
-Roket BNO055 sensöründen Roll ($r$) ve Pitch ($p$) açılarını alır. Roketin Z ekseninin (burnunun) gerçek dikey ile yaptığı açı ($\theta$) şu şekilde bulunur:
-$$\theta = \arccos(\cos(p) \times \cos(r)) \times \frac{180}{\pi}$$
-*(Kalman filtresi gürültüleri sebebiyle $\cos(p) \times \cos(r)$ çarpımı 1.0'ı aşarsa kodda `constrain` ile korunarak NaN (Not a Number) hatası önlenmiştir.)*
+Roket BNO055 sensöründen Roll (r) ve Pitch (p) açılarını alır. Roketin Z ekseninin (burnunun) gerçek dikey ile yaptığı açı (Tilt) şu şekilde bulunur:
+```text
+Tilt Açısı = acos( cos(Pitch) * cos(Roll) ) * (180 / PI)
+```
+*(Kalman filtresi gürültüleri sebebiyle cos(p)*cos(r) çarpımı 1.0'ı aşarsa kodda `constrain` ile korunarak NaN hatası önlenmiştir.)*
 
 ### Apogee Tespiti ve Durum Makinesi (State Machine)
 Durum makinesi 5 fazdan oluşur: `HAZIR`, `YUKSELIYOR`, `INIS_1`, `INIS_2`, `INDI`.
