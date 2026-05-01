@@ -236,7 +236,7 @@ struct TelemetryPacket {
     float ivmeX, ivmeY, ivmeZ;
     float gyroX, gyroY, gyroZ;
     float roll, pitch, yaw;
-    float basinc, bmeSicaklik, irtifa, nem;
+    float irtifa;
     float dikeyHiz; // Yeni eklenen dikey hız verisi
     float eglimAcisi; // Yeni eklenen eğim açısı
     float gpsEnlem, gpsBoylam;
@@ -342,12 +342,11 @@ uint16_t crc16_ccitt(const uint8_t* data, size_t len) {
 // --- BUFFERLI (PING-PONG) SD YAZMA ---
 void bufferla_ve_yaz_sd(File& file, const TelemetryPacket& pkt) {
     char temp_line[160];
-    // Paketi CSV satırına dönüştür
+    // Paketi CSV satırına dönüştür (basinc, sicaklik, nem kaldirildi)
     int line_len = snprintf(temp_line, sizeof(temp_line), 
-        "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.6f,%.6f,%d,%d,%d\n",
+        "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.6f,%.6f,%d,%d,%d\n",
         pkt.ivmeX, pkt.ivmeY, pkt.ivmeZ, pkt.gyroX, pkt.gyroY, pkt.gyroZ,
-        pkt.roll, pkt.pitch, pkt.yaw, pkt.basinc, pkt.bmeSicaklik,
-        pkt.irtifa, pkt.nem, pkt.dikeyHiz, pkt.eglimAcisi,
+        pkt.roll, pkt.pitch, pkt.yaw, pkt.irtifa, pkt.dikeyHiz, pkt.eglimAcisi,
         pkt.gpsEnlem, pkt.gpsBoylam, pkt.ayrilma1_durum, pkt.ayrilma2_durum, pkt.ucus_durumu);
 
     char* current_buf = (active_sd_buf == 0) ? sd_dma_buf_A : sd_dma_buf_B;
@@ -525,8 +524,7 @@ void Task1code(void *pvParameters) {
     packet.ivmeX = ivmeX; packet.ivmeY = ivmeY; packet.ivmeZ = ivmeZ;
     packet.gyroX = gyroX; packet.gyroY = gyroY; packet.gyroZ = gyroZ;
     packet.roll = roll; packet.pitch = pitch; packet.yaw = yaw;
-    packet.basinc = basinc; packet.bmeSicaklik = bmeSicaklik; 
-    packet.irtifa = irtifa; packet.nem = nem;
+    packet.irtifa = irtifa;
     packet.dikeyHiz = anlik_dikey_hiz; // Pakete dikey hızı ekle
     packet.eglimAcisi = eglim_acisi; // Pakete eğim açısını ekle
     packet.gpsEnlem = gpsEnlem; packet.gpsBoylam = gpsBoylam;
@@ -642,7 +640,7 @@ void setup() {
         if (logFile) {
             // Dosya yeni oluşturulduysa veya boşsa başlık yaz
             if (logFile.size() == 0) {
-                logFile.println("ivmeX,ivmeY,ivmeZ,gyroX,gyroY,gyroZ,roll,pitch,yaw,basinc,sicaklik,irtifa,nem,hiz,eglim,lat,lng,ayr1,ayr2,state");
+                logFile.println("ivmeX,ivmeY,ivmeZ,gyroX,gyroY,gyroZ,roll,pitch,yaw,irtifa,hiz,eglim,lat,lng,ayr1,ayr2,state");
             }
             sdOk = true;
         } else {
@@ -658,7 +656,7 @@ void setup() {
     }
     Serial1.println("BNO055 baslatildi.");
     // BNO055'i harici kristal kullanmaya ayarlamak okumaları daha stabil yapar
-    bno.setExtCrystalUse(true);
+    // bno.setExtCrystalUse(true);
 
     // BNO055 Kalibrasyon Kalitesi Bekleme
     // begin() başarılı olsa bile kalibrasyon dakikalar alabilir.

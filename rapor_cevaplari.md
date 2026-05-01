@@ -137,14 +137,14 @@ Kurtarılması gereken roket bileşenleri ve görev yükünün yer tespiti için
 #### 1. Konum Verisi Edinme Mimarisi
 
 Sistemde kullanılan **GY-NEO-7M GPS** modülü, 9600 baud hızında UART2 (Serial2) portu üzerinden ESP32'ye bağlıdır. 
-*   **Arkaplan İşleme:** GPS verileri, `TinyGPS++` kütüphanesi yardımıyla Core 0 üzerindeki döngü içerisinde asenkron olarak okunur. Uydu kilidi (Sat Lock) sağlandığı anda enlem, boylam ve GPS irtifası verileri güncellenerek `TelemetryPacket` yapısına dahil edilir.
+*   **Arkaplan İşleme:** GPS verileri, `TinyGPS++` kütüphanesi yardımıyla Core 0 üzerindeki döngü içerisinde asenkron olarak okunur. Uydu kilidi (Sat Lock) sağlandığı anda enlem ve boylam verileri güncellenerek `TelemetryPacket` yapısına dahil edilir.
 *   **Kesintisiz Takip:** GPS sinyali anlık olarak kaybolsa dahi, algoritma yer istasyonuna en son bilinen geçerli konumu (last known location) göndermeye devam ederek operatöre arama-kurtarma operasyonu için referans noktası sağlar.
 
 #### 2. Veri Mimarisi ve Paketleme (Data Framing)
 
 Konum bilgisinin güvenli iletimi için "Çerçevelenmiş İkili Veri Mimarisi" (Framed Binary Data Architecture) uygulanmaktadır. Bu mimarinin bileşenleri şunlardır:
 
-*   **Entegre Veri Yapısı (Struct Entegrasyonu):** Konum verileri, telemetri paketinden ayrı bir parça değil, 71 byte'lık `TelemetryPacket` yapısının ayrılmaz bir parçasıdır. Bu sayede her bir ivme veya irtifa paketiyle birlikte güncel koordinatlar da tek bir atomik işlemle gönderilir.
+*   **Entegre Veri Yapısı (Struct Entegrasyonu):** Konum verileri, telemetri paketinden ayrı bir parça değil, 59 byte'lık `TelemetryPacket` yapısının ayrılmaz bir parçasıdır. Bu sayede her bir ivme veya irtifa paketiyle birlikte güncel koordinatlar da tek bir atomik işlemle gönderilir.
 *   **Dinamik Güncelleme Frekansı:** GPS modülü 1 Hz veya 5 Hz hızında veri üretse de, haberleşme ünitesi (Core 1) yer istasyonuna **10 Hz** hızında telemetri basar. Bu durum, yer istasyonunda koordinatların takılmadan, akışkan bir şekilde izlenmesini sağlar.
 *   **Hata Denetimi (CRC16):** Koordinat verileri (Enlem/Boylam) float (4-byte) formatında taşındığı için havadaki gürültüden kaynaklanacak 1 bitlik sapma bile yanlış konuma yönlendirebilir. Mimari, her paketin sonuna eklenen **CRC16-CCITT** kontrolü ile koordinat verisinin doğruluğunu yer istasyonunda %100 teyit eder.
 
