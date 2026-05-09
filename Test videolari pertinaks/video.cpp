@@ -541,8 +541,10 @@ void setup() {
     // Sensör Başlatma İşlemleri
     if (!bno.begin()) {
         const char* err1 = "KRITIK: BNO055 bulunamadi! Sistem durduruluyor.\n";
-        uart_write_bytes(UART_NUM_1, err1, strlen(err1));
-        while(true) { vTaskDelay(1000 / portTICK_PERIOD_MS); }
+        while(true) { 
+            uart_write_bytes(UART_NUM_1, err1, strlen(err1));
+            vTaskDelay(1000 / portTICK_PERIOD_MS); 
+        }
     }
     const char* msg1 = "BNO055 baslatildi.\n";
     uart_write_bytes(UART_NUM_1, msg1, strlen(msg1));
@@ -571,8 +573,10 @@ void setup() {
     // BME280 genelde 0x76 veya 0x77 I2C adresi kullanır
     if (!bme.begin(BME280_ADDR_PRIMARY) && !bme.begin(BME280_ADDR_SECONDARY)) {
         const char* err2 = "KRITIK: BME280 bulunamadi! Sistem durduruluyor.\n";
-        uart_write_bytes(UART_NUM_1, err2, strlen(err2));
-        while(true) { vTaskDelay(1000 / portTICK_PERIOD_MS); }
+        while(true) { 
+            uart_write_bytes(UART_NUM_1, err2, strlen(err2));
+            vTaskDelay(1000 / portTICK_PERIOD_MS); 
+        }
     }
     const char* msg4 = "BME280 baslatildi.\n";
     uart_write_bytes(UART_NUM_1, msg4, strlen(msg4));
@@ -604,19 +608,35 @@ void setup() {
     telemetryQueue = xQueueCreate(TELEMETRY_QUEUE_LEN, sizeof(TelemetryPacket));
     if(telemetryQueue == NULL){
       const char* err3 = "KRITIK: Kuyruk olusturulamadi! Sistem durduruluyor.\n";
-      uart_write_bytes(UART_NUM_1, err3, strlen(err3));
-      while(true) { vTaskDelay(1000 / portTICK_PERIOD_MS); }
+      while(true) { 
+          uart_write_bytes(UART_NUM_1, err3, strlen(err3));
+          vTaskDelay(1000 / portTICK_PERIOD_MS); 
+      }
     }
 
     // 5. RTOS Görevleri
     // Core 0: Genelde sensör okuma ve uçuş algoritması (Kritik işler)
-    xTaskCreatePinnedToCore(
+    BaseType_t res1 = xTaskCreatePinnedToCore(
         Task1code, "UcusGörevi", TASK_STACK_SIZE, NULL, TASK1_PRIORITY, &Task1, 0); 
+    if (res1 != pdPASS) {
+        const char* err_task1 = "KRITIK: UcusGorevi baslatilamadi!\n";
+        while(true) {
+            uart_write_bytes(UART_NUM_1, err_task1, strlen(err_task1));
+            vTaskDelay(1000 / portTICK_PERIOD_MS);
+        }
+    }
     delay(100); // Kısa bir nefes payı
 
     // Core 1: Genelde yer istasyonu haberleşmesi ve SD kart (Yavaş işler)
-    xTaskCreatePinnedToCore(
+    BaseType_t res2 = xTaskCreatePinnedToCore(
         Task2code, "HaberlesmeGörevi", TASK_STACK_SIZE, NULL, TASK2_PRIORITY, &Task2, 1); 
+    if (res2 != pdPASS) {
+        const char* err_task2 = "KRITIK: HaberlesmeGorevi baslatilamadi!\n";
+        while(true) {
+            uart_write_bytes(UART_NUM_1, err_task2, strlen(err_task2));
+            vTaskDelay(1000 / portTICK_PERIOD_MS);
+        }
+    }
     
     const char* msg6 = "Setup Tamam. Gorevler Dagitildi.\n";
     uart_write_bytes(UART_NUM_1, msg6, strlen(msg6));
