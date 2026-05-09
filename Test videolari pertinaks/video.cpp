@@ -4,9 +4,6 @@
 #include <Adafruit_BNO055.h>
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BME280.h>
-#include <TinyGPS++.h>
-#include <SD.h>
-#include <FS.h>
 #include "driver/uart.h"      // DMA destekli UART sürücüsü
 #include "esp_heap_caps.h"    // DMA uyumlu bellek yönetimi
 /*
@@ -14,7 +11,7 @@
   YAPILACAKLAR LİSTESİ (TODO & MİMARİ PLAN)
 ================================================================================
   [ CORE 0 (Uçuş Kontrolü & Kritik İşlemler) ]
-  - [x] Sensör Verilerinin Okunması (BNO055, BME280, GPS)
+  - [x] Sensör Verilerinin Okunması (BNO055, BME280)
   - [x] Uçuş Algoritması (Apogee tespiti, serbest düşüş anlama vb.)
   - [x] Fünye (Ateşleme) Kontrollerinin durum makinesi (State Machine) ile yapılması
   - [x] Kalibrasyon ve Başlangıç İrtifası / Basıncı referans alımı
@@ -52,14 +49,7 @@
      - Nem (%)                     -> nem
      - Hesaplanan İrtifa (Metre)   -> irtifa
 
-  3. GY-NEO-7M (GPS - Konum, Yükseklik)
-     - Enlem                       -> gpsEnlem
-     - Boylam                      -> gpsBoylam
-     - GPS İrtifası (Metre)        -> gpsIrtifa
-     - Bağlı Uydu Sayısı           -> gpsUydu
-     - Konum Geçerliliği           -> gpsGecerli
-
-  4. TELEMETRİ PAKETİ (TelemetryPacket Struct)
+  3. TELEMETRİ PAKETİ (TelemetryPacket Struct)
      - Yukarıdaki tüm veriler ve roketin kurtarma durumları (Ayrılma1/2), 
        'TelemetryPacket' isimli yapıya (struct) doldurulur.
      - Pragma pack(1) kullanıldığı için veriler bellekte boşluksuz dizilir, 
@@ -80,8 +70,6 @@ float referans_basinc = 1013.25;
 #define PIN_BUZZER 12
 #define PIN_LED 13
 #define PIN_FUNYE_2 14
-#define PIN_GPS_RX 16
-#define PIN_GPS_TX 17
 #define PIN_SPI_CLK 18
 #define PIN_SPI_MISO 19
 #define PIN_I2C_SDA 21
@@ -92,24 +80,22 @@ float referans_basinc = 1013.25;
 #define PIN_FUNYE_1 27
 #define PIN_LORA_TX 32
 #define PIN_LORA_RX 33
-#define PIN_SDKART_DET 35
 
 // Haberleşme Sabitleri
-#define BAUD_GPS               9600  // UART2  — GY-NEO-7M GPS modülü
 #define BAUD_LORA              9600  // UART1  — E32-433T30D LoRa modülü (SX1278 tabanlı)
 #define UART_BUFFER_SIZE       1024  // TX buffer (Non-Blocking gönderim için)
 
 // --- ÇERÇEVE PROTOKOLü (Framed Binary) ---
-// Format: [0xAA][0x55][LEN:1B][TelemetryPacket:59B][CRC16_HI:1B][CRC16_LO:1B]
+// Format: [0xAA][0x55][LEN:1B][TelemetryPacket:51B][CRC16_HI:1B][CRC16_LO:1B]
 // CRC algoritması: CRC16-CCITT (poly=0x1021, init=0xFFFF)
 // Not: E32-433T30D kendi RF katmanında CRC/FEC yapıyor.
 //      Uygulama katmanı CRC'si UART hattını ve buffer kaymalarını korur.
 #define SYNC_BYTE_1          0xAA
 #define SYNC_BYTE_2          0x55
-// FRAME_SIZE: struct sonrasında hesaplanır → sizeof(TelemetryPacket) + 2+1+2 = 64 byte
+// FRAME_SIZE: struct sonrasında hesaplanır → sizeof(TelemetryPacket) + 2+1+2 = 56 byte
 
 // --- LORA GÖNDERİM HIZI ---
-// E32-433T30D @ 9600 baud, 64 byte/çerçeve → ~15 çerçeve/sn max
+// E32-433T30D @ 9600 baud, 56 byte/çerçeve → ~15 çerçeve/sn max
 // Core 0 queue → 100 Hz; LoRa → her LORA_GONDERIM_ORANI pakettte bir (≈10 Hz)
 #define LORA_GONDERIM_ORANI    10
 
@@ -213,7 +199,6 @@ SimpleKalmanFilter kf_nem(1.0, 1.0, 0.1);
 // --- SENSÖR NESNELERİ ---
 Adafruit_BNO055 bno = Adafruit_BNO055(BNO055_DEF, BNO055_ADDR); 
 Adafruit_BME280 bme; // I2C üzerinden iletişim
-TinyGPSPlus gps;
 
 // --- SENSÖR VERİ DEĞİŞKENLERİ ---
 // IMU (BNO055) Verileri
@@ -224,9 +209,6 @@ float roll = 0.0, pitch = 0.0, yaw = 0.0;
 
 // Barometre (BME280) Verileri
 float basinc = 0.0, bmeSicaklik = 0.0, irtifa = 0.0, nem = 0.0;
-
-// GPS Verileri
-float gpsEnlem = 0.0, gpsBoylam = 0.0;
 
 // --- TELEMETRİ YAPISI VE KUYRUK ---
 // "pragma pack(push, 1)" struct'ın bellekte boşluksuz (padding olmadan) paketlenmesini sağlar,
@@ -239,26 +221,13 @@ struct TelemetryPacket {
     float irtifa;
     float dikeyHiz; // Yeni eklenen dikey hız verisi
     float eglimAcisi; // Yeni eklenen eğim açısı
-    float gpsEnlem, gpsBoylam;
     bool ayrilma1_durum;
     bool ayrilma2_durum;
     uint8_t ucus_durumu; // Uçuş evresi: 0=Hazır, 1=Yükseliyor, 2=İniş1, 3=İniş2, 4=İndi
 };
 #pragma pack(pop)
 
-// DMA uyumlu telemetri paketi pointer'ı
-TelemetryPacket* dma_packet; 
-
-// SD Kart Ping-Pong Buffer Tanımları
-#define SD_DMA_BUF_SIZE 512
-char* sd_dma_buf_A;
-char* sd_dma_buf_B;
-volatile int active_sd_buf = 0; // 0: A, 1: B
-volatile int sd_buf_idx = 0;
-
 QueueHandle_t telemetryQueue;
-File logFile;
-bool sdOk = false;
 
 // Hazır Kullanılacak Metodlar/Fonksiyonlar
 
@@ -339,37 +308,6 @@ uint16_t crc16_ccitt(const uint8_t* data, size_t len) {
     return crc;
 }
 
-// --- BUFFERLI (PING-PONG) SD YAZMA ---
-void bufferla_ve_yaz_sd(File& file, const TelemetryPacket& pkt) {
-    char temp_line[160];
-    // Paketi CSV satırına dönüştür (basinc, sicaklik, nem kaldirildi)
-    int line_len = snprintf(temp_line, sizeof(temp_line), 
-        "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.6f,%.6f,%d,%d,%d\n",
-        pkt.ivmeX, pkt.ivmeY, pkt.ivmeZ, pkt.gyroX, pkt.gyroY, pkt.gyroZ,
-        pkt.roll, pkt.pitch, pkt.yaw, pkt.irtifa, pkt.dikeyHiz, pkt.eglimAcisi,
-        pkt.gpsEnlem, pkt.gpsBoylam, pkt.ayrilma1_durum, pkt.ayrilma2_durum, pkt.ucus_durumu);
-
-    char* current_buf = (active_sd_buf == 0) ? sd_dma_buf_A : sd_dma_buf_B;
-
-    // Eğer yeni satır mevcut tampona sığmıyorsa, tamponu boşalt (Ping-Pong)
-    if (sd_buf_idx + line_len >= SD_DMA_BUF_SIZE) {
-        // Mevcut tamponu SD karta toplu (DMA dostu) olarak bas
-        if (file) {
-            file.write((const uint8_t*)current_buf, sd_buf_idx);
-            // file.flush(); // Performans için her seferinde flush yapmıyoruz
-        }
-        
-        // Tampon değiştir (Ping-Pong)
-        active_sd_buf = (active_sd_buf == 0) ? 1 : 0;
-        current_buf = (active_sd_buf == 0) ? sd_dma_buf_A : sd_dma_buf_B;
-        sd_buf_idx = 0;
-    }
-
-    // Veriyi aktif tampona kopyala
-    memcpy(&current_buf[sd_buf_idx], temp_line, line_len);
-    sd_buf_idx += line_len;
-}
-
 // --- ÇERÇEVELI PAKET GÖNDERME (DMA DESTEKLI UART) ---
 void gonder_paket_framed_dma(uart_port_t uart_num, const TelemetryPacket& pkt) {
     static uint8_t frame_buf[80]; // DMA uyumlu buffer (statik bellek genelde DMA erişimine uygundur)
@@ -438,18 +376,6 @@ void Task1code(void *pvParameters) {
 
     // Anlık dikey hızı (Vz) hesapla
     anlik_dikey_hiz = hesapla_dikey_hiz(irtifa);
-
-    // 3. GPS Verilerini Okuma
-    // Serial2 üzerinden gelen verileri TinyGPS++ nesnesine besliyoruz
-    while (Serial2.available() > 0) {
-        gps.encode(Serial2.read());
-    }
-    
-    // GPS konumu güncellendiyse değişkenlere alıyoruz
-    if (gps.location.isUpdated()) {
-        gpsEnlem = gps.location.lat();
-        gpsBoylam = gps.location.lng();
-    }
 
 
     // --- FÜNYE ZAMANLAMA KONTROLÜ (Non-Blocking) ---
@@ -527,7 +453,6 @@ void Task1code(void *pvParameters) {
     packet.irtifa = irtifa;
     packet.dikeyHiz = anlik_dikey_hiz; // Pakete dikey hızı ekle
     packet.eglimAcisi = eglim_acisi; // Pakete eğim açısını ekle
-    packet.gpsEnlem = gpsEnlem; packet.gpsBoylam = gpsBoylam;
     packet.ayrilma1_durum = ayrilma1; packet.ayrilma2_durum = ayrilma2;
     packet.ucus_durumu = (uint8_t)durum;
 
@@ -547,8 +472,8 @@ void Task1code(void *pvParameters) {
 // LoRa (UART1 / Serial1) → E32-433T30D modülü     @   9600 baud  → Her 10. paket (~10 Hz)
 // SD Kart                 → Kara kutu loglama      @ CSV format   → HER paket (~100 Hz)
 //
-// ÇERÇEVE FORMATI (64 byte/paket):
-//   [0xAA][0x55][LEN=59][...TelemetryPacket 59B...][CRC16_HI][CRC16_LO]
+// ÇERÇEVE FORMATI (56 byte/paket):
+//   [0xAA][0x55][LEN=51][...TelemetryPacket 51B...][CRC16_HI][CRC16_LO]
 //
 // CRC16-CCITT: UART hattında bit flip / buffer kayması tespiti.
 // E32-433T30D zaten RF katmanında CRC/FEC yapıyor; bu uygulama katmanı CRC'si.
@@ -562,19 +487,7 @@ void Task2code(void *pvParameters) {
     // Queue'dan paket al (CPU'yu yormadan veri gelene kadar bekler)
     if (xQueueReceive(telemetryQueue, &incomingPacket, portMAX_DELAY) == pdTRUE) {
 
-        // 1. SD Kart — Ping-Pong Buffer ile Logla (~100 Hz)
-        if (sdOk && logFile) {
-            bufferla_ve_yaz_sd(logFile, incomingPacket);
-            
-            // Periyodik Flush (Gerçekten SD karta yazılması için)
-            static int flush_sayac = 0;
-            if (++flush_sayac >= 100) { // Her 1 saniyede bir fiziksel kayıt
-                logFile.flush();
-                flush_sayac = 0;
-            }
-        }
-
-        // 2. LoRa (E32-433T30D) — Asenkron DMA Gönderimi (~10 Hz)
+        // 1. LoRa (E32-433T30D) — Asenkron DMA Gönderimi (~10 Hz)
         lora_sayac++;
         if (lora_sayac >= LORA_GONDERIM_ORANI) {
             gonder_paket_framed_dma(UART_NUM_1, incomingPacket);
@@ -600,17 +513,12 @@ void setup() {
     pinMode(PIN_LED_1, OUTPUT);
     pinMode(PIN_LED_2, OUTPUT);
     pinMode(PIN_LED_3, OUTPUT);
-    pinMode(PIN_SDKART_DET, INPUT_PULLUP); // SD kart algılama genelde pull-up gerektirir
 
     // 3. Protokoller ve DMA Bellek Tahsisi
-    sd_dma_buf_A = (char*)heap_caps_malloc(SD_DMA_BUF_SIZE, MALLOC_CAP_DMA);
-    sd_dma_buf_B = (char*)heap_caps_malloc(SD_DMA_BUF_SIZE, MALLOC_CAP_DMA);
-    
     Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL); 
     SPI.begin(PIN_SPI_CLK, PIN_SPI_MISO, PIN_SPI_MOSI, PIN_SPI_CS);
 
     // 4. Modül Haberleşmeleri — LoRa'yı sensörlerden ÖNCE başlat
-    Serial2.begin(BAUD_GPS, SERIAL_8N1, PIN_GPS_RX, PIN_GPS_TX);
     
     // LoRa (UART1) DMA Yapılandırması
     uart_config_t uart_config = {
@@ -630,57 +538,44 @@ void setup() {
     const char* start_msg = "--- ROKET SISTEMI BASLATILIYOR (DMA ACTIVE) ---\n";
     uart_write_bytes(UART_NUM_1, start_msg, strlen(start_msg));
 
-    // SD Kart Başlatma
-    if (!SD.begin(PIN_SPI_CS)) {
-        Serial1.println("UYARI: SD Kart baslatilamadi! Loglama yapilmayacak.");
-        sdOk = false;
-    } else {
-        Serial1.println("SD Kart baslatildi.");
-        logFile = SD.open("/ucus_log.csv", FILE_APPEND);
-        if (logFile) {
-            // Dosya yeni oluşturulduysa veya boşsa başlık yaz
-            if (logFile.size() == 0) {
-                logFile.println("ivmeX,ivmeY,ivmeZ,gyroX,gyroY,gyroZ,roll,pitch,yaw,irtifa,hiz,eglim,lat,lng,ayr1,ayr2,state");
-            }
-            sdOk = true;
-        } else {
-            Serial1.println("HATA: Log dosyasi acilamadi!");
-            sdOk = false;
-        }
-    }
-
     // Sensör Başlatma İşlemleri
     if (!bno.begin()) {
-        Serial1.println("KRITIK: BNO055 bulunamadi! Sistem durduruluyor.");
+        const char* err1 = "KRITIK: BNO055 bulunamadi! Sistem durduruluyor.\n";
+        uart_write_bytes(UART_NUM_1, err1, strlen(err1));
         while(true) { vTaskDelay(1000 / portTICK_PERIOD_MS); }
     }
-    Serial1.println("BNO055 baslatildi.");
+    const char* msg1 = "BNO055 baslatildi.\n";
+    uart_write_bytes(UART_NUM_1, msg1, strlen(msg1));
     // BNO055'i harici kristal kullanmaya ayarlamak okumaları daha stabil yapar
     // bno.setExtCrystalUse(true);
 
     // BNO055 Kalibrasyon Kalitesi Bekleme
     // begin() başarılı olsa bile kalibrasyon dakikalar alabilir.
     // Kalibre olmamış sensorden apogee kararı vermek tehlikelidir.
-    Serial1.println("BNO055 kalibrasyonu bekleniyor...");
+    const char* msg2 = "BNO055 kalibrasyonu bekleniyor...\n";
+    uart_write_bytes(UART_NUM_1, msg2, strlen(msg2));
     {
         uint8_t cal_sys = 0, cal_gyro = 0, cal_accel = 0, cal_mag = 0;
         while (cal_sys < BNO055_MIN_KALIBRASYON) {
             bno.getCalibration(&cal_sys, &cal_gyro, &cal_accel, &cal_mag);
             char buf[80];
-            snprintf(buf, sizeof(buf), "Kal: Sys=%d/3 Gyro=%d/3 Accel=%d/3 Mag=%d/3",
+            snprintf(buf, sizeof(buf), "Kal: Sys=%d/3 Gyro=%d/3 Accel=%d/3 Mag=%d/3\n",
                      cal_sys, cal_gyro, cal_accel, cal_mag);
-            Serial1.println(buf);
+            uart_write_bytes(UART_NUM_1, buf, strlen(buf));
             vTaskDelay(500 / portTICK_PERIOD_MS);
         }
     }
-    Serial1.println("BNO055 kalibrasyonu tamamlandi!");
+    const char* msg3 = "BNO055 kalibrasyonu tamamlandi!\n";
+    uart_write_bytes(UART_NUM_1, msg3, strlen(msg3));
 
     // BME280 genelde 0x76 veya 0x77 I2C adresi kullanır
     if (!bme.begin(BME280_ADDR_PRIMARY) && !bme.begin(BME280_ADDR_SECONDARY)) {
-        Serial1.println("KRITIK: BME280 bulunamadi! Sistem durduruluyor.");
+        const char* err2 = "KRITIK: BME280 bulunamadi! Sistem durduruluyor.\n";
+        uart_write_bytes(UART_NUM_1, err2, strlen(err2));
         while(true) { vTaskDelay(1000 / portTICK_PERIOD_MS); }
     }
-    Serial1.println("BME280 baslatildi.");
+    const char* msg4 = "BME280 baslatildi.\n";
+    uart_write_bytes(UART_NUM_1, msg4, strlen(msg4));
     // Gelişmiş okuma ayarları (BME280)
     bme.setSampling(Adafruit_BME280::MODE_NORMAL,
                     Adafruit_BME280::SAMPLING_X2,  // Sicaklik
@@ -691,7 +586,8 @@ void setup() {
 
     // 3.1 Ground Kalibrasyon: Anlık yer seviyesi basıncını ölç (20 örnek ortalaması)
     delay(200);
-    Serial1.println("Yer kalibrasyonu yapiliyor...");
+    const char* msg5 = "Yer kalibrasyonu yapiliyor...\n";
+    uart_write_bytes(UART_NUM_1, msg5, strlen(msg5));
     float basinc_toplam = 0.0;
     for (int i = 0; i < 20; i++) {
         basinc_toplam += bme.readPressure() / 100.0F; // Pascal → hPa
@@ -700,14 +596,15 @@ void setup() {
     referans_basinc = basinc_toplam / 20.0;
     {
         char buf[40];
-        snprintf(buf, sizeof(buf), "Referans Basinc (hPa): %.2f", referans_basinc);
-        Serial1.println(buf);
+        snprintf(buf, sizeof(buf), "Referans Basinc (hPa): %.2f\n", referans_basinc);
+        uart_write_bytes(UART_NUM_1, buf, strlen(buf));
     }
 
     // FreeRTOS Kuyruk Başlatma (Maksimum 10 paketlik yer ayıralım)
     telemetryQueue = xQueueCreate(TELEMETRY_QUEUE_LEN, sizeof(TelemetryPacket));
     if(telemetryQueue == NULL){
-      Serial1.println("KRITIK: Kuyruk olusturulamadi! Sistem durduruluyor.");
+      const char* err3 = "KRITIK: Kuyruk olusturulamadi! Sistem durduruluyor.\n";
+      uart_write_bytes(UART_NUM_1, err3, strlen(err3));
       while(true) { vTaskDelay(1000 / portTICK_PERIOD_MS); }
     }
 
@@ -721,7 +618,8 @@ void setup() {
     xTaskCreatePinnedToCore(
         Task2code, "HaberlesmeGörevi", TASK_STACK_SIZE, NULL, TASK2_PRIORITY, &Task2, 1); 
     
-    Serial1.println("Setup Tamam. Gorevler Dagitildi.");
+    const char* msg6 = "Setup Tamam. Gorevler Dagitildi.\n";
+    uart_write_bytes(UART_NUM_1, msg6, strlen(msg6));
 }
 void loop() {
   // FreeRTOS görevleri oluşturduğumuz için loop() içini genellikle boş veya
