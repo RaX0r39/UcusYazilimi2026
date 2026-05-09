@@ -10,23 +10,19 @@ float referans_basinc = 1013.25;
 // Uyarlanabilir Pinler 
 #define PIN_I2C_SDA 21
 #define PIN_I2C_SCL 22
-#define PIN_LORA_TX 32
-#define PIN_LORA_RX 33
+#define PIN_LORA_TX 33
+#define PIN_LORA_RX 32
 
 // Haberleşme Sabitleri
 #define BAUD_LORA              9600
 #define LORA_GONDERIM_ORANI    10
-
-// --- ÇERÇEVE PROTOKOLü (Framed Binary) ---
-#define SYNC_BYTE_1          0xAA
-#define SYNC_BYTE_2          0x55
 
 // Sensör Sabitleri
 #define BNO055_DEF 55
 #define BNO055_ADDR 0x28
 #define BME280_ADDR_PRIMARY 0x76
 #define BME280_ADDR_SECONDARY 0x77
-#define BNO055_MIN_KALIBRASYON 1
+#define BNO055_MIN_KALIBRASYON 0
 
 // Uçuş Algoritması Sabitleri
 #define APOGEE_IRTIFA_FARKI   15.0  // m
@@ -152,35 +148,6 @@ float hesapla_dikey_hiz(float guncel_irtifa) {
     return hiz_z;
 }
 
-uint16_t crc16_ccitt(const uint8_t* data, size_t len) {
-    uint16_t crc = 0xFFFF;
-    for (size_t i = 0; i < len; i++) {
-        crc ^= ((uint16_t)data[i] << 8);
-        for (int j = 0; j < 8; j++) {
-            crc = (crc & 0x8000) ? (crc << 1) ^ 0x1021 : (crc << 1);
-        }
-    }
-    return crc;
-}
-
-void gonder_paket_framed(const TelemetryPacket& pkt) {
-    static uint8_t frame_buf[80]; 
-    const uint8_t* payload = (const uint8_t*)&pkt;
-    const size_t   len     = sizeof(TelemetryPacket);
-    uint16_t       crc     = crc16_ccitt(payload, len);
-
-    size_t idx = 0;
-    frame_buf[idx++] = SYNC_BYTE_1;
-    frame_buf[idx++] = SYNC_BYTE_2;
-    frame_buf[idx++] = (uint8_t)len;
-    memcpy(&frame_buf[idx], payload, len);
-    idx += len;
-    frame_buf[idx++] = (uint8_t)(crc >> 8);
-    frame_buf[idx++] = (uint8_t)(crc & 0xFF);
-
-    loraSerial.write(frame_buf, idx);
-}
-
 // Loglama fonksiyonu: Hem Serial'e (USB) hem LoRa'ya basar
 void logMesaj(const char* msg) {
     Serial.print(msg);
@@ -282,11 +249,13 @@ void Task2code(void *pvParameters) {
     if (xQueueReceive(telemetryQueue, &incomingPacket, portMAX_DELAY) == pdTRUE) {
         lora_sayac++;
         if (lora_sayac >= LORA_GONDERIM_ORANI) {
-            gonder_paket_framed(incomingPacket);
+            // Ekranda (Serial Monitor'de) okunabilmesi için metin (ASCII) formatında basıyoruz
+            loraSerial.printf("Irtifa: %.2f | Vz: %.2f | Eglim: %.2f | Pitch: %.2f | Durum: %d\n", 
+                          incomingPacket.irtifa, incomingPacket.dikeyHiz, incomingPacket.eglimAcisi, incomingPacket.pitch, incomingPacket.ucus_durumu);
             
             // Saniyede 1 kez sensör verilerini Serial'den (USB) izleyebilmek için
-            Serial.printf("Irtifa: %.2f | Vz: %.2f | Eglim: %.2f | Pitch: %.2f\n", 
-                          incomingPacket.irtifa, incomingPacket.dikeyHiz, incomingPacket.eglimAcisi, incomingPacket.pitch);
+            Serial.printf("Irtifa: %.2f | Vz: %.2f | Eglim: %.2f | Pitch: %.2f | Durum: %d\n", 
+                          incomingPacket.irtifa, incomingPacket.dikeyHiz, incomingPacket.eglimAcisi, incomingPacket.pitch, incomingPacket.ucus_durumu);
                           
             lora_sayac = 0;
         }
@@ -300,7 +269,7 @@ void setup() {
     delay(1000);
     
     // LoRa Serial (UART1)
-    loraSerial.begin(BAUD_LORA, SERIAL_8N1, PIN_LORA_RX, PIN_LORA_TX);
+    loraSerial.begin(BAUD_LORA, SERIAL_8N1, 32, 33);
     delay(500);
     
     logMesaj("\n--- ROKET TEST SISTEMI BASLATILIYOR (Sadece Sensorler & LoRa) ---\n");
