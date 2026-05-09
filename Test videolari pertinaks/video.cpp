@@ -1,119 +1,41 @@
 #include <Arduino.h>
 #include <Wire.h>
-#include <SPI.h>
 #include <Adafruit_BNO055.h>
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BME280.h>
-#include "driver/uart.h"      // DMA destekli UART sürücüsü
-#include "esp_heap_caps.h"    // DMA uyumlu bellek yönetimi
-/*
-================================================================================
-  YAPILACAKLAR LİSTESİ (TODO & MİMARİ PLAN)
-================================================================================
-  [ CORE 0 (Uçuş Kontrolü & Kritik İşlemler) ]
-  - [x] Sensör Verilerinin Okunması (BNO055, BME280)
-  - [x] Uçuş Algoritması (Apogee tespiti, serbest düşüş anlama vb.)
-  - [x] Fünye (Ateşleme) Kontrollerinin durum makinesi (State Machine) ile yapılması
-  - [x] Kalibrasyon ve Başlangıç İrtifası / Basıncı referans alımı
-  - [ ] BNO055 Z-Ekseni Yön Kalibrasyonu (Şu an Z ekseni yukarı varsayılıyor, doğrulanmalı!)
-
-  [ CORE 1 (Haberleşme & Çevre Birimleri) ]
-   - [x] LoRa üzerinden Non-Blocking Veri Aktarımı
-   - [x] Yer İstasyonu Formatına Göre Verinin Metin (String/CSV) Olarak Parse Edilmesi
-   - [x] SD Karta Loglama (Kara Kutu): Verilerin uçuş esnasında kaydedilmesi
-   - [x] TTL devre dışı bırakıldı — pinler boş duruyor
- 
-  [ ORTAK / GENEL ]
-  - [x] Sensör ve Haberleşme donanımları arası FreeRTOS Queue aktarımı
-  - [x] Kalman Filtresi ekle
-  - [x] Kurtarma Sistemi Durum (Ayrılma1/Ayrılma2) bayraklarının haberleşme paketine doğru işlenmesi
-  - [ ] Buzzer ve LED uyarı sistemlerinin uçuş evrelerine (State) bağlanması
-
-  [ PERFORMANS / OPTİMİZASYON ]
-  - [x] DMA'nın daha iyi implemente edilmesi
-================================================================================
-*/
-
-/*
-================================================================================
-  SENSÖR VERİ HARİTASI (Hangi veri nereden alınıyor ve değişkendeki adı ne?)
-================================================================================
-  1. BNO055 (IMU - İvme, Jiroskop, Yönelim)
-     - Doğrusal İvme (Yerçekimsiz) -> ivmeX, ivmeY, ivmeZ
-     - Jiroskop (Açısal Hız)       -> gyroX, gyroY, gyroZ
-     - Euler Açıları (Yönelim)     -> roll, pitch, yaw
-  
-  2. BME280 (Barometre - Basınç, Sıcaklık, Nem, İrtifa)
-     - Basınç (Pascal)             -> basinc
-     - Sıcaklık (Santigrat)        -> bmeSicaklik
-     - Nem (%)                     -> nem
-     - Hesaplanan İrtifa (Metre)   -> irtifa
-
-  3. TELEMETRİ PAKETİ (TelemetryPacket Struct)
-     - Yukarıdaki tüm veriler ve roketin kurtarma durumları (Ayrılma1/2), 
-       'TelemetryPacket' isimli yapıya (struct) doldurulur.
-     - Pragma pack(1) kullanıldığı için veriler bellekte boşluksuz dizilir, 
-       bu sayede yer istasyonuna (LoRa) ham (binary) ve en hızlı şekilde iletilir.
-================================================================================
-*/
-
 
 // Uyarlanabilir Sabitler
-// referans_basinc: setup() içinde BME280'den otomatik ölçülür. Başlangıç değeri standart deniz seviyesidir.
 float referans_basinc = 1013.25;
 
 // Uyarlanabilir Pinler 
-#define PIN_TTL_RX 1
-#define PIN_TTL_TX 3
-#define PIN_LED_2 4
-#define PIN_SPI_CS 5
-#define PIN_BUZZER 12
-#define PIN_LED 13
-#define PIN_FUNYE_2 14
-#define PIN_SPI_CLK 18
-#define PIN_SPI_MISO 19
 #define PIN_I2C_SDA 21
 #define PIN_I2C_SCL 22
-#define PIN_SPI_MOSI 23
-#define PIN_LED_3 25
-#define PIN_LED_1 26
-#define PIN_FUNYE_1 27
 #define PIN_LORA_TX 32
 #define PIN_LORA_RX 33
 
 // Haberleşme Sabitleri
-#define BAUD_LORA              9600  // UART1  — E32-433T30D LoRa modülü (SX1278 tabanlı)
-#define UART_BUFFER_SIZE       1024  // TX buffer (Non-Blocking gönderim için)
+#define BAUD_LORA              9600
+#define LORA_GONDERIM_ORANI    10
 
 // --- ÇERÇEVE PROTOKOLü (Framed Binary) ---
-// Format: [0xAA][0x55][LEN:1B][TelemetryPacket:51B][CRC16_HI:1B][CRC16_LO:1B]
-// CRC algoritması: CRC16-CCITT (poly=0x1021, init=0xFFFF)
-// Not: E32-433T30D kendi RF katmanında CRC/FEC yapıyor.
-//      Uygulama katmanı CRC'si UART hattını ve buffer kaymalarını korur.
 #define SYNC_BYTE_1          0xAA
 #define SYNC_BYTE_2          0x55
-// FRAME_SIZE: struct sonrasında hesaplanır → sizeof(TelemetryPacket) + 2+1+2 = 56 byte
-
-// --- LORA GÖNDERİM HIZI ---
-// E32-433T30D @ 9600 baud, 56 byte/çerçeve → ~15 çerçeve/sn max
-// Core 0 queue → 100 Hz; LoRa → her LORA_GONDERIM_ORANI pakettte bir (≈10 Hz)
-#define LORA_GONDERIM_ORANI    10
 
 // Sensör Sabitleri
 #define BNO055_DEF 55
 #define BNO055_ADDR 0x28
 #define BME280_ADDR_PRIMARY 0x76
 #define BME280_ADDR_SECONDARY 0x77
+#define BNO055_MIN_KALIBRASYON 1
 
 // Uçuş Algoritması Sabitleri
-#define APOGEE_IRTIFA_FARKI   15.0  // m     - Max irtifadan bu kadar düşünce apogee sayılır (BME280)
-#define AYRILMA2_MESAFE      550.0  // m     - Bu irtifanın altında ana paraşüt açılır
-#define MAX_EGLIM             10.0  // derece - Bu açıdan fazla eğimde apogee sayılmaz (güvenlik)
-#define MIN_DIKEY_HIZ          0.0  // m/s   - Bu değerin altı (negatif) = düşüyor (BME280)
-#define KALKIS_IVME_ESIGI     20.0  // m/s²  - Z ekseninde bu ivmenin üstü = kalkış (BNO055)
-#define INIS_HIZ_ESIGI         2.0  // m/s   - Bu değerin altı = yerde sayılır
-#define INIS_IRTIFA_ESIGI     20.0  // m     - Bu irtifanın altı = yerde sayılır
-#define BNO055_MIN_KALIBRASYON 1    // 0-3 arası - Bu sistem kalibrasyon puanının altında beklenir
+#define APOGEE_IRTIFA_FARKI   15.0  // m
+#define AYRILMA2_MESAFE      550.0  // m
+#define MAX_EGLIM             10.0  // derece
+#define MIN_DIKEY_HIZ          0.0  // m/s
+#define KALKIS_IVME_ESIGI     20.0  // m/s²
+#define INIS_HIZ_ESIGI         2.0  // m/s
+#define INIS_IRTIFA_ESIGI     20.0  // m
 
 // FreeRTOS Sabitleri
 #define TASK_STACK_SIZE 10000
@@ -121,37 +43,28 @@ float referans_basinc = 1013.25;
 #define TASK2_PRIORITY 1
 #define TELEMETRY_QUEUE_LEN 10
 
-// Görev takipçisi (Task Handle) tanımları
-TaskHandle_t Task1;
-TaskHandle_t Task2;
-
 // Uçuş Durum Makinesi (State Machine)
 enum UcusDurumu {
-    HAZIR      = 0, // Rampa üzerinde, kalkış bekleniyor
-    YUKSELIYOR = 1, // Kalkış algılandı, yükselme fazı
-    INIS_1     = 2, // Apogee geçildi, drogue (küçük) paraşüt açıldı
-    INIS_2     = 3, // Alçak irtifaya inildi, ana paraşüt açıldı
-    INDI       = 4  // Yere iniş tamamlandı, sistem pasif
+    HAZIR      = 0,
+    YUKSELIYOR = 1,
+    INIS_1     = 2,
+    INIS_2     = 3,
+    INDI       = 4
 };
 UcusDurumu durum = HAZIR;
 
-//Uçuş Algoritması İçin Gerekli Değişkenler
 bool ayrilma1 = false;
 bool ayrilma2 = false;
 float max_irtifa_degeri = 0.0;
 
-// --- FÜNYE ZAMANLAMA (Non-Blocking) ---
-#define FUNYE_SURE_MS 400  // Fünyeye enerji verilecek süre (ms)
-unsigned long funye1_baslangic = 0;  // 0 = aktif değil
-unsigned long funye2_baslangic = 0;
-bool funye1_aktif = false;
-bool funye2_aktif = false;
+TaskHandle_t Task1;
+TaskHandle_t Task2;
 
 // --- HIZ HESAPLAMA DEĞİŞKENLERİ ---
 float onceki_irtifa = 0.0;
 unsigned long onceki_zaman = 0;
 float anlik_dikey_hiz = 0.0;
-float eglim_acisi = 0.0; // Roketin dikeyden sapma açısı (Tilt)
+float eglim_acisi = 0.0;
 
 // --- KALMAN FİLTRESİ SINIFI ---
 class SimpleKalmanFilter {
@@ -180,7 +93,6 @@ class SimpleKalmanFilter {
 };
 
 // --- KALMAN FİLTRESİ NESNELERİ ---
-// Parametreler: (Ölçüm Hatası, Tahmin Hatası, Süreç Gürültüsü)
 SimpleKalmanFilter kf_ivmeX(0.1, 0.1, 0.01);
 SimpleKalmanFilter kf_ivmeY(0.1, 0.1, 0.01);
 SimpleKalmanFilter kf_ivmeZ(0.1, 0.1, 0.01);
@@ -198,105 +110,48 @@ SimpleKalmanFilter kf_nem(1.0, 1.0, 0.1);
 
 // --- SENSÖR NESNELERİ ---
 Adafruit_BNO055 bno = Adafruit_BNO055(BNO055_DEF, BNO055_ADDR); 
-Adafruit_BME280 bme; // I2C üzerinden iletişim
+Adafruit_BME280 bme; 
 
 // --- SENSÖR VERİ DEĞİŞKENLERİ ---
-// IMU (BNO055) Verileri
 float ivmeX = 0.0, ivmeY = 0.0, ivmeZ = 0.0;
 float gyroX = 0.0, gyroY = 0.0, gyroZ = 0.0;
-// BNO055'in roketçilikte en büyük avantajı Euler açılarını donanımsal hesaplamasıdır:
 float roll = 0.0, pitch = 0.0, yaw = 0.0; 
-
-// Barometre (BME280) Verileri
 float basinc = 0.0, bmeSicaklik = 0.0, irtifa = 0.0, nem = 0.0;
 
-// --- TELEMETRİ YAPISI VE KUYRUK ---
-// "pragma pack(push, 1)" struct'ın bellekte boşluksuz (padding olmadan) paketlenmesini sağlar,
-// bu sayede UART üzerinden ham byte olarak (DMA tarzında) basmak çok daha güvenli ve tutarlı olur.
 #pragma pack(push, 1)
 struct TelemetryPacket {
     float ivmeX, ivmeY, ivmeZ;
     float gyroX, gyroY, gyroZ;
     float roll, pitch, yaw;
     float irtifa;
-    float dikeyHiz; // Yeni eklenen dikey hız verisi
-    float eglimAcisi; // Yeni eklenen eğim açısı
-    bool ayrilma1_durum;
+    float dikeyHiz; 
+    float eglimAcisi; 
+    bool ayrilma1_durum; 
     bool ayrilma2_durum;
-    uint8_t ucus_durumu; // Uçuş evresi: 0=Hazır, 1=Yükseliyor, 2=İniş1, 3=İniş2, 4=İndi
+    uint8_t ucus_durumu; 
 };
 #pragma pack(pop)
 
 QueueHandle_t telemetryQueue;
 
-// Hazır Kullanılacak Metodlar/Fonksiyonlar
+HardwareSerial loraSerial(1); // UART1
 
-// Non-Blocking fünye ateşleme: Pini HIGH yapar, zamanı kaydeder.
-// 400ms sonra funye_guncelle() otomatik kapatır.
-void Funye1Atesle(){
-    if (!funye1_aktif) {
-        digitalWrite(PIN_FUNYE_1, HIGH);
-        funye1_baslangic = millis();
-        funye1_aktif = true;
-        ayrilma1 = true;
-    }
-}
-
-void Funye2Atesle(){
-    if (!funye2_aktif) {
-        digitalWrite(PIN_FUNYE_2, HIGH);
-        funye2_baslangic = millis();
-        funye2_aktif = true;
-        ayrilma2 = true;
-    }
-}
-
-// Her döngüde çağrılmalı — süresi dolan fünyeyi kapatır
-void funye_guncelle() {
-    if (funye1_aktif && (millis() - funye1_baslangic >= FUNYE_SURE_MS)) {
-        digitalWrite(PIN_FUNYE_1, LOW);
-        funye1_aktif = false;
-    }
-    if (funye2_aktif && (millis() - funye2_baslangic >= FUNYE_SURE_MS)) {
-        digitalWrite(PIN_FUNYE_2, LOW);
-        funye2_aktif = false;
-    }
-}
-
-// Görseldeki formüle göre Anlık Dikey Hız (Vz) Hesaplama Fonksiyonu
 float hesapla_dikey_hiz(float guncel_irtifa) {
     unsigned long suanki_zaman = micros();
-    
-    // İlk ölçüm kontrolü
     if (onceki_zaman == 0) {
         onceki_zaman = suanki_zaman;
         onceki_irtifa = guncel_irtifa;
         return 0.0;
     }
-    
-    // Delta t hesaplaması (mikrosaniyeden saniyeye dönüşüm)
     float delta_t = (float)(suanki_zaman - onceki_zaman) / 1000000.0f;
-    
-    // Bölme hatası (divide-by-zero) koruması
-    if (delta_t <= 0.0) {
-        return anlik_dikey_hiz; // Geçerli zaman farkı yoksa eski hızı koru
-    }
-    
-    // Delta Altitude (İrtifa farkı)
+    if (delta_t <= 0.0) return anlik_dikey_hiz; 
     float delta_irtifa = guncel_irtifa - onceki_irtifa;
-    
-    // V_z = Delta Altitude / Delta t
     float hiz_z = delta_irtifa / delta_t;
-    
-    // Gelecek hesaplama için değerleri güncelle
     onceki_zaman = suanki_zaman;
     onceki_irtifa = guncel_irtifa;
-    
     return hiz_z;
 }
 
-// --- CRC16-CCITT (poly=0x1021, init=0xFFFF) ---
-// E32-433T30D UART hattında bit flip / buffer kayması tespiti için
 uint16_t crc16_ccitt(const uint8_t* data, size_t len) {
     uint16_t crc = 0xFFFF;
     for (size_t i = 0; i < len; i++) {
@@ -308,10 +163,8 @@ uint16_t crc16_ccitt(const uint8_t* data, size_t len) {
     return crc;
 }
 
-// --- ÇERÇEVELI PAKET GÖNDERME (DMA DESTEKLI UART) ---
-void gonder_paket_framed_dma(uart_port_t uart_num, const TelemetryPacket& pkt) {
-    static uint8_t frame_buf[80]; // DMA uyumlu buffer (statik bellek genelde DMA erişimine uygundur)
-    
+void gonder_paket_framed(const TelemetryPacket& pkt) {
+    static uint8_t frame_buf[80]; 
     const uint8_t* payload = (const uint8_t*)&pkt;
     const size_t   len     = sizeof(TelemetryPacket);
     uint16_t       crc     = crc16_ccitt(payload, len);
@@ -325,237 +178,145 @@ void gonder_paket_framed_dma(uart_port_t uart_num, const TelemetryPacket& pkt) {
     frame_buf[idx++] = (uint8_t)(crc >> 8);
     frame_buf[idx++] = (uint8_t)(crc & 0xFF);
 
-    // uart_write_bytes: Veriyi dahili halka tampona (ring buffer) atar ve hemen döner.
-    // Arka plandaki UART donanımı veriyi asenkron olarak (DMA-like) gönderir.
-    uart_write_bytes(uart_num, (const char*)frame_buf, idx);
+    loraSerial.write(frame_buf, idx);
 }
 
-// Core 0'da çalışacak olan görevin fonsiyonu
+// Loglama fonksiyonu: Hem Serial'e (USB) hem LoRa'ya basar
+void logMesaj(const char* msg) {
+    Serial.print(msg);
+    loraSerial.print(msg);
+}
+
 void Task1code(void *pvParameters) {
- 
-
   for (;;) {
-    // ----------------------------------------------------
-    // KENDI KODUNUZU BURAYA YAZIN (CORE 0 - SÜREKLİ DÖNGÜ)
-    // ----------------------------------------------------
-
-    // 1. IMU (BNO055) Verilerini Okuma
     sensors_event_t a, g, o;
-    // İvme (Linear Acceleration - Yerçekimi hariç)
     bno.getEvent(&a, Adafruit_BNO055::VECTOR_LINEARACCEL);
     ivmeX = kf_ivmeX.updateEstimate(a.acceleration.x);
     ivmeY = kf_ivmeY.updateEstimate(a.acceleration.y);
     ivmeZ = kf_ivmeZ.updateEstimate(a.acceleration.z);
 
-    // Jiroskop
     bno.getEvent(&g, Adafruit_BNO055::VECTOR_GYROSCOPE);
     gyroX = kf_gyroX.updateEstimate(g.gyro.x);
     gyroY = kf_gyroY.updateEstimate(g.gyro.y);
     gyroZ = kf_gyroZ.updateEstimate(g.gyro.z);
 
-    // Euler Açıları (Yönelim)
     bno.getEvent(&o, Adafruit_BNO055::VECTOR_EULER);
     yaw = kf_yaw.updateEstimate(o.orientation.x);
     roll = kf_roll.updateEstimate(o.orientation.y);
     pitch = kf_pitch.updateEstimate(o.orientation.z);
 
-    // Roketin yere göre eğim açısını (Tilt Angle) hesapla (0 = Tam dik)
     float p_rad = pitch * DEG_TO_RAD;
     float r_rad = roll * DEG_TO_RAD;
-    // [FIX] Kalman gürültüsü cos(p)*cos(r)'yi 1.0'ı aşabilir → acos(NaN) → apogee asla tetiklenmez
     float cos_val = cos(p_rad) * cos(r_rad);
     cos_val = constrain(cos_val, -1.0f, 1.0f);
     eglim_acisi = acos(cos_val) * RAD_TO_DEG;
 
-    // 2. Barometre (BME280) Verilerini Okuma
     bmeSicaklik = kf_bmeSicaklik.updateEstimate(bme.readTemperature());
     basinc = kf_basinc.updateEstimate(bme.readPressure());
     nem = kf_nem.updateEstimate(bme.readHumidity());
-    // referans_basinc: setup() içinde BME280'den otomatik kalibre edildi
     irtifa = kf_irtifa.updateEstimate(bme.readAltitude(referans_basinc));
 
-    // Anlık dikey hızı (Vz) hesapla
     anlik_dikey_hiz = hesapla_dikey_hiz(irtifa);
-
-
-    // --- FÜNYE ZAMANLAMA KONTROLÜ (Non-Blocking) ---
-    funye_guncelle();
 
     // --- UÇUŞ ALGORİTMASI ---
     switch (durum) {
         case HAZIR:
-            // Kalkış tespiti: Z ekseninde yeterli ivme → YUKSELIYOR
-            // [ TODO ] BNO055 Z-ekseni yönü doğrulanmalı!
             if (ivmeZ > KALKIS_IVME_ESIGI) {
                 durum = YUKSELIYOR;
             }
             break;
 
         case YUKSELIYOR:
-            // Max irtifa güncelle (sadece yükseliş fazında)
             if (irtifa > max_irtifa_degeri) {
                 max_irtifa_degeri = irtifa;
             }
 
-            // ================================================================
-            // APOGEE TESPİTİ: 2 BAĞIMSIZ SENSÖR + GÜVENLİK KAPISI
-            // ================================================================
-            //
-            // [SENSÖR 1 - BME280 Barometrik - 2 Koşul]
-            //   Kriter A: İrtifa max değerden 15m düştü (yükselme durdu)
-            //   Kriter B: Dikey hız negatif (irtifadan türev alınarak hesaplandı)
-            //
-            // [SENSÖR 2 - BNO055 IMU - 1 Koşul]
-            //   Kriter C: Dikey doğrusal ivme 3 m/s² altına düştü.
-            //   Neden?→ Motor durmuş + sürtünme bitti = roket serbest düşüşe geçti.
-            //   Apogee'de Z-ivmesi sıfıra yaklaşır, sonra hafif negatiç olur.
-            //   Bu BME280'den tamamen bağımsız, ikinci bir fiziksel onay.
-            //
-            // [GÜVENLİK KAPISI - BNO055 - 1 Koşul]
-            //   Kriter D: Eğilm açısı < 10° (roket tümbling yapmıyor)
-            //   Bu apogee algılaması değil, yanlış pozisyonda ateşlemeyi engeller.
-            //
-            // TÜM KOŞULLAR sağlanırsa Fünye1 ateşlenir.
-            // ================================================================
-            if ((max_irtifa_degeri - irtifa > APOGEE_IRTIFA_FARKI) &&  // [BME280] A
-                (anlik_dikey_hiz < MIN_DIKEY_HIZ) &&                   // [BME280] B
-                (eglim_acisi < MAX_EGLIM)) {                           // [BNO055] D - Güvenlik
-                Funye1Atesle(); // Drogue paraşüt → 1. Ayrılma
+            if ((max_irtifa_degeri - irtifa > APOGEE_IRTIFA_FARKI) &&  
+                (anlik_dikey_hiz < MIN_DIKEY_HIZ) &&                   
+                (eglim_acisi < MAX_EGLIM)) {                           
+                ayrilma1 = true;
                 durum = INIS_1;
             }
             break;
 
         case INIS_1:
-            // Alçak irtifaya inildiğinde ana paraşütü aç → 2. Ayrılma
             if ((irtifa < AYRILMA2_MESAFE) && (max_irtifa_degeri > AYRILMA2_MESAFE)) {
-                Funye2Atesle(); // Ana paraşüt
+                ayrilma2 = true;
                 durum = INIS_2;
             }
             break;
 
         case INIS_2:
-            // Yere iniş tespiti: hız sıfıra yakın + çok alçakta
             if ((anlik_dikey_hiz > -INIS_HIZ_ESIGI) && (irtifa < INIS_IRTIFA_ESIGI)) {
                 durum = INDI;
             }
             break;
 
         case INDI:
-            // Sistem pasif, hiçbir aksiyon alınmaz
             break;
     }
 
-    // --- STRUCT DOLDURMA VE CORE 1'E GÖNDERME ---
     TelemetryPacket packet;
     packet.ivmeX = ivmeX; packet.ivmeY = ivmeY; packet.ivmeZ = ivmeZ;
     packet.gyroX = gyroX; packet.gyroY = gyroY; packet.gyroZ = gyroZ;
     packet.roll = roll; packet.pitch = pitch; packet.yaw = yaw;
     packet.irtifa = irtifa;
-    packet.dikeyHiz = anlik_dikey_hiz; // Pakete dikey hızı ekle
-    packet.eglimAcisi = eglim_acisi; // Pakete eğim açısını ekle
-    packet.ayrilma1_durum = ayrilma1; packet.ayrilma2_durum = ayrilma2;
+    packet.dikeyHiz = anlik_dikey_hiz; 
+    packet.eglimAcisi = eglim_acisi; 
+    
+    packet.ayrilma1_durum = ayrilma1; 
+    packet.ayrilma2_durum = ayrilma2;
     packet.ucus_durumu = (uint8_t)durum;
 
-    // Kuyruğa Gönder (Kuyruk doluysa beklemez (0), veriyi atlar. 
-    // Sensör okuma hızının bloke olmasını engelleriz.)
     xQueueSend(telemetryQueue, &packet, 0);
 
-    // KESİNLİKLE SİLİNMESİ YASAKTIR: Eğer burası boş döngüde kalırsa ESP32 Watchdog hatası verir ve çöker!
-    vTaskDelay(10 / portTICK_PERIOD_MS); // Yaklaşık 100 Hz çalışma frekansı
+    vTaskDelay(10 / portTICK_PERIOD_MS); 
   }
 }
 
-// Core 1'de çalışacak olan görevin fonsiyonu
-// ─────────────────────────────────────────────────────────────────────────────
-// GÖREVİ: Core 0'dan gelen TelemetryPacket'i çerçeveleyip LoRa ve SD'ye gönderir.
-//
-// LoRa (UART1 / Serial1) → E32-433T30D modülü     @   9600 baud  → Her 10. paket (~10 Hz)
-// SD Kart                 → Kara kutu loglama      @ CSV format   → HER paket (~100 Hz)
-//
-// ÇERÇEVE FORMATI (56 byte/paket):
-//   [0xAA][0x55][LEN=51][...TelemetryPacket 51B...][CRC16_HI][CRC16_LO]
-//
-// CRC16-CCITT: UART hattında bit flip / buffer kayması tespiti.
-// E32-433T30D zaten RF katmanında CRC/FEC yapıyor; bu uygulama katmanı CRC'si.
-// ─────────────────────────────────────────────────────────────────────────────
 void Task2code(void *pvParameters) {
-
   TelemetryPacket incomingPacket;
-  uint32_t lora_sayac = 0; // LoRa hız sınırlayıcı sayacı
+  uint32_t lora_sayac = 0; 
 
   for (;;) {
-    // Queue'dan paket al (CPU'yu yormadan veri gelene kadar bekler)
     if (xQueueReceive(telemetryQueue, &incomingPacket, portMAX_DELAY) == pdTRUE) {
-
-        // 1. LoRa (E32-433T30D) — Asenkron DMA Gönderimi (~10 Hz)
         lora_sayac++;
         if (lora_sayac >= LORA_GONDERIM_ORANI) {
-            gonder_paket_framed_dma(UART_NUM_1, incomingPacket);
+            gonder_paket_framed(incomingPacket);
+            
+            // Saniyede 1 kez sensör verilerini Serial'den (USB) izleyebilmek için
+            Serial.printf("Irtifa: %.2f | Vz: %.2f | Eglim: %.2f | Pitch: %.2f\n", 
+                          incomingPacket.irtifa, incomingPacket.dikeyHiz, incomingPacket.eglimAcisi, incomingPacket.pitch);
+                          
             lora_sayac = 0;
         }
     }
-    // portMAX_DELAY ile Queue'da beklediğimiz için vTaskDelay gerekmez.
-    // CPU xQueueReceive içinde güvenle uyur, Watchdog tetiklenmez.
   }
 }
 
 void setup() {
-    // 1. TTL kullanılmıyor — Serial başlatılmadı, pinler boşta
-
-    // 2. Pin Modları ve Güvenlik (Tasklardan ÖNCE yapılmalı)
-    pinMode(PIN_FUNYE_1, OUTPUT);
-    pinMode(PIN_FUNYE_2, OUTPUT);
-    digitalWrite(PIN_FUNYE_1, LOW);
-    digitalWrite(PIN_FUNYE_2, LOW);
+    // USB Serial (PC'den okumak için)
+    Serial.begin(115200);
+    delay(1000);
     
-    pinMode(PIN_BUZZER, OUTPUT);
-    pinMode(PIN_LED, OUTPUT);
-    pinMode(PIN_LED_1, OUTPUT);
-    pinMode(PIN_LED_2, OUTPUT);
-    pinMode(PIN_LED_3, OUTPUT);
+    // LoRa Serial (UART1)
+    loraSerial.begin(BAUD_LORA, SERIAL_8N1, PIN_LORA_RX, PIN_LORA_TX);
+    delay(500);
+    
+    logMesaj("\n--- ROKET TEST SISTEMI BASLATILIYOR (Sadece Sensorler & LoRa) ---\n");
 
-    // 3. Protokoller ve DMA Bellek Tahsisi
     Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL); 
-    SPI.begin(PIN_SPI_CLK, PIN_SPI_MISO, PIN_SPI_MOSI, PIN_SPI_CS);
 
-    // 4. Modül Haberleşmeleri — LoRa'yı sensörlerden ÖNCE başlat
-    
-    // LoRa (UART1) DMA Yapılandırması
-    uart_config_t uart_config = {
-        .baud_rate = BAUD_LORA,
-        .data_bits = UART_DATA_8_BITS,
-        .parity    = UART_PARITY_DISABLE,
-        .stop_bits = UART_STOP_BITS_1,
-        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE
-    };
-    // Sürücüyü kur: 2048 byte RX buffer, 2048 byte TX buffer (DMA asenkronluğu için)
-    uart_driver_install(UART_NUM_1, 2048, 2048, 0, NULL, 0);
-    uart_param_config(UART_NUM_1, &uart_config);
-    uart_set_pin(UART_NUM_1, PIN_LORA_TX, PIN_LORA_RX, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
-
-    delay(500); 
-    
-    const char* start_msg = "--- ROKET SISTEMI BASLATILIYOR (DMA ACTIVE) ---\n";
-    uart_write_bytes(UART_NUM_1, start_msg, strlen(start_msg));
-
-    // Sensör Başlatma İşlemleri
     if (!bno.begin()) {
         const char* err1 = "KRITIK: BNO055 bulunamadi! Sistem durduruluyor.\n";
         while(true) { 
-            uart_write_bytes(UART_NUM_1, err1, strlen(err1));
+            logMesaj(err1);
             vTaskDelay(1000 / portTICK_PERIOD_MS); 
         }
     }
-    const char* msg1 = "BNO055 baslatildi.\n";
-    uart_write_bytes(UART_NUM_1, msg1, strlen(msg1));
-    // BNO055'i harici kristal kullanmaya ayarlamak okumaları daha stabil yapar
-    // bno.setExtCrystalUse(true);
+    logMesaj("BNO055 baslatildi.\n");
 
-    // BNO055 Kalibrasyon Kalitesi Bekleme
-    // begin() başarılı olsa bile kalibrasyon dakikalar alabilir.
-    // Kalibre olmamış sensorden apogee kararı vermek tehlikelidir.
-    const char* msg2 = "BNO055 kalibrasyonu bekleniyor...\n";
-    uart_write_bytes(UART_NUM_1, msg2, strlen(msg2));
+    logMesaj("BNO055 kalibrasyonu bekleniyor...\n");
     {
         uint8_t cal_sys = 0, cal_gyro = 0, cal_accel = 0, cal_mag = 0;
         while (cal_sys < BNO055_MIN_KALIBRASYON) {
@@ -563,91 +324,74 @@ void setup() {
             char buf[80];
             snprintf(buf, sizeof(buf), "Kal: Sys=%d/3 Gyro=%d/3 Accel=%d/3 Mag=%d/3\n",
                      cal_sys, cal_gyro, cal_accel, cal_mag);
-            uart_write_bytes(UART_NUM_1, buf, strlen(buf));
+            logMesaj(buf);
             vTaskDelay(500 / portTICK_PERIOD_MS);
         }
     }
-    const char* msg3 = "BNO055 kalibrasyonu tamamlandi!\n";
-    uart_write_bytes(UART_NUM_1, msg3, strlen(msg3));
+    logMesaj("BNO055 kalibrasyonu tamamlandi!\n");
 
-    // BME280 genelde 0x76 veya 0x77 I2C adresi kullanır
     if (!bme.begin(BME280_ADDR_PRIMARY) && !bme.begin(BME280_ADDR_SECONDARY)) {
         const char* err2 = "KRITIK: BME280 bulunamadi! Sistem durduruluyor.\n";
         while(true) { 
-            uart_write_bytes(UART_NUM_1, err2, strlen(err2));
+            logMesaj(err2);
             vTaskDelay(1000 / portTICK_PERIOD_MS); 
         }
     }
-    const char* msg4 = "BME280 baslatildi.\n";
-    uart_write_bytes(UART_NUM_1, msg4, strlen(msg4));
-    // Gelişmiş okuma ayarları (BME280)
+    logMesaj("BME280 baslatildi.\n");
     bme.setSampling(Adafruit_BME280::MODE_NORMAL,
-                    Adafruit_BME280::SAMPLING_X2,  // Sicaklik
-                    Adafruit_BME280::SAMPLING_X16, // Basinc
-                    Adafruit_BME280::SAMPLING_X1,  // Nem
+                    Adafruit_BME280::SAMPLING_X2, 
+                    Adafruit_BME280::SAMPLING_X16, 
+                    Adafruit_BME280::SAMPLING_X1,  
                     Adafruit_BME280::FILTER_X16,
                     Adafruit_BME280::STANDBY_MS_0_5);
 
-    // 3.1 Ground Kalibrasyon: Anlık yer seviyesi basıncını ölç (20 örnek ortalaması)
     delay(200);
-    const char* msg5 = "Yer kalibrasyonu yapiliyor...\n";
-    uart_write_bytes(UART_NUM_1, msg5, strlen(msg5));
+    logMesaj("Yer kalibrasyonu yapiliyor...\n");
     float basinc_toplam = 0.0;
     for (int i = 0; i < 20; i++) {
-        basinc_toplam += bme.readPressure() / 100.0F; // Pascal → hPa
+        basinc_toplam += bme.readPressure() / 100.0F; 
         delay(50);
     }
     referans_basinc = basinc_toplam / 20.0;
     {
         char buf[40];
         snprintf(buf, sizeof(buf), "Referans Basinc (hPa): %.2f\n", referans_basinc);
-        uart_write_bytes(UART_NUM_1, buf, strlen(buf));
+        logMesaj(buf);
     }
 
-    // FreeRTOS Kuyruk Başlatma (Maksimum 10 paketlik yer ayıralım)
     telemetryQueue = xQueueCreate(TELEMETRY_QUEUE_LEN, sizeof(TelemetryPacket));
     if(telemetryQueue == NULL){
       const char* err3 = "KRITIK: Kuyruk olusturulamadi! Sistem durduruluyor.\n";
       while(true) { 
-          uart_write_bytes(UART_NUM_1, err3, strlen(err3));
+          logMesaj(err3);
           vTaskDelay(1000 / portTICK_PERIOD_MS); 
       }
     }
 
-    // 5. RTOS Görevleri
-    // Core 0: Genelde sensör okuma ve uçuş algoritması (Kritik işler)
     BaseType_t res1 = xTaskCreatePinnedToCore(
-        Task1code, "UcusGörevi", TASK_STACK_SIZE, NULL, TASK1_PRIORITY, &Task1, 0); 
+        Task1code, "UcusGorevi", TASK_STACK_SIZE, NULL, TASK1_PRIORITY, &Task1, 0); 
     if (res1 != pdPASS) {
         const char* err_task1 = "KRITIK: UcusGorevi baslatilamadi!\n";
         while(true) {
-            uart_write_bytes(UART_NUM_1, err_task1, strlen(err_task1));
+            logMesaj(err_task1);
             vTaskDelay(1000 / portTICK_PERIOD_MS);
         }
     }
-    delay(100); // Kısa bir nefes payı
+    delay(100); 
 
-    // Core 1: Genelde yer istasyonu haberleşmesi ve SD kart (Yavaş işler)
     BaseType_t res2 = xTaskCreatePinnedToCore(
-        Task2code, "HaberlesmeGörevi", TASK_STACK_SIZE, NULL, TASK2_PRIORITY, &Task2, 1); 
+        Task2code, "HaberlesmeGorevi", TASK_STACK_SIZE, NULL, TASK2_PRIORITY, &Task2, 1); 
     if (res2 != pdPASS) {
         const char* err_task2 = "KRITIK: HaberlesmeGorevi baslatilamadi!\n";
         while(true) {
-            uart_write_bytes(UART_NUM_1, err_task2, strlen(err_task2));
+            logMesaj(err_task2);
             vTaskDelay(1000 / portTICK_PERIOD_MS);
         }
     }
     
-    const char* msg6 = "Setup Tamam. Gorevler Dagitildi.\n";
-    uart_write_bytes(UART_NUM_1, msg6, strlen(msg6));
+    logMesaj("Setup Tamam. Sensorler Okunuyor ve LoRa uzerinden iletiliyor.\n");
 }
-void loop() {
-  // FreeRTOS görevleri oluşturduğumuz için loop() içini genellikle boş veya
-  // basit işler için kullanır mıyız Aslında loop() fonksiyonu varsayılan olarak
-  // Core 1 üzerinde bir FreeRTOS görevi gibi çalışır. Bu nedenle ana işlemleri
-  // yukarıdaki Task1code ve Task2code içine yazmalısınız.
 
-  // Sonsuz döngüde arka plan işleri / Watchdog için küçük bir gecikme eklemek
-  // iyi bir pratiktir:
+void loop() {
   vTaskDelay(1000 / portTICK_PERIOD_MS);
 }
