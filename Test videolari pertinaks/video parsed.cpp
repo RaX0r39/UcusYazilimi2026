@@ -276,7 +276,6 @@ void Task1code(void *pvParameters) {
     vTaskDelay(10 / portTICK_PERIOD_MS); 
   }
 }
-
 void Task2code(void *pvParameters) {
   TelemetryPacket incomingPacket;
   uint32_t lora_sayac = 0; 
